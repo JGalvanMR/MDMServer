@@ -27,35 +27,48 @@ public class RateLimitMiddleware
 
     public RateLimitMiddleware(RequestDelegate next, ILogger<RateLimitMiddleware> logger)
     {
-        _next    = next;
-        _logger  = logger;
+        _next = next;
+        _logger = logger;
         _options = new RateLimitOptions();
     }
 
+    // En RateLimitMiddleware.cs — cambiar la key del contador
     public async Task InvokeAsync(HttpContext context)
     {
         var path = context.Request.Path.Value ?? "";
-        var rule = _rules.FirstOrDefault(r => path.StartsWith(r.Key, StringComparison.OrdinalIgnoreCase));
+        var rule = _rules.FirstOrDefault(r =>
+            path.StartsWith(r.Key, StringComparison.OrdinalIgnoreCase));
 
         if (rule.Key != null)
         {
-            var ip  = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-            var key = $"{ip}:{rule.Key}";
-
-            if (IsRateLimited(key, rule.Value.WindowSecs, rule.Value.MaxReqs))
+            // Para endpoints de dispositivo usar el token como key
+            // Para admin usar IP
+            string rateLimitKey;
+            if (path.StartsWith("/api/device/", StringComparison.OrdinalIgnoreCase) &&
+                context.Request.Headers.TryGetValue("Device-Token", out var token) &&
+                !string.IsNullOrEmpty(token))
             {
-                _logger.LogWarning("Rate limit excedido: IP={Ip} Path={Path}", ip, path);
+                // Por token: cada dispositivo tiene su propia ventana
+                rateLimitKey = $"token:{token.ToString()[..Math.Min(16, token.ToString().Length)]}:{rule.Key}";
+            }
+            else
+            {
+                // Por IP para admin y register (sin token)
+                var ip = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+                rateLimitKey = $"ip:{ip}:{rule.Key}";
+            }
 
+            if (IsRateLimited(rateLimitKey, rule.Value.WindowSecs, rule.Value.MaxReqs))
+            {
+                _logger.LogWarning("Rate limit excedido: Key={Key} Path={Path}", rateLimitKey, path);
                 context.Response.StatusCode = 429;
                 context.Response.Headers["Retry-After"] = rule.Value.WindowSecs.ToString();
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync(
-                    """{"success":false,"error":"Rate limit excedido. Reduce la frecuencia de solicitudes."}"""
-                );
+                    """{"success":false,"error":"Rate limit excedido."}""");
                 return;
             }
         }
-
         await _next(context);
     }
 
@@ -82,8 +95,8 @@ public class RateLimitMiddleware
 
 public class RateLimitOptions
 {
-    public int PollWindowSeconds      { get; set; } = 10;
-    public int PollMaxRequests        { get; set; } = 3;
-    public int RegisterWindowSeconds  { get; set; } = 60;
-    public int RegisterMaxRequests    { get; set; } = 5;
+    public int PollWindowSeconds { get; set; } = 10;
+    public int PollMaxRequests { get; set; } = 3;
+    public int RegisterWindowSeconds { get; set; } = 60;
+    public int RegisterMaxRequests { get; set; } = 5;
 }

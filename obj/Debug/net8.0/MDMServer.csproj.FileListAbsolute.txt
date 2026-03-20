@@ -86,3 +86,4 @@ C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\refint\MDMServer.dll
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.pdb
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.genruntimeconfig.cache
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\ref\MDMServer.dll
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.sourcelink.json

@@ -1,5 +1,7 @@
+using Dapper;
 using MDMServer.Core;
 using MDMServer.Core.Exceptions;
+using MDMServer.Data;
 using MDMServer.DTOs.Command;
 using MDMServer.DTOs.Device;
 using MDMServer.DTOs.Poll;
@@ -12,32 +14,37 @@ namespace MDMServer.Services;
 public interface IDeviceService
 {
     Task<(Device Device, bool IsNew)> AuthenticateOrThrowAsync(string token);
-    Task<RegisterDeviceResponse>      RegisterAsync(RegisterDeviceRequest request, string clientIp);
-    Task                              UpdateHeartbeatAsync(string deviceId, HeartbeatRequest request, string? ip);
-    Task<List<DeviceListItemDto>>     GetAllAsync();
-    Task<DeviceDetailDto>             GetDetailAsync(string deviceId);
-    Task                              DeactivateAsync(string deviceId);
-    Task                              UpdateNotesAsync(string deviceId, string notes);
-    Task<SystemStatsDto>              GetStatsAsync();
+    Task<RegisterDeviceResponse> RegisterAsync(RegisterDeviceRequest request, string clientIp);
+    Task UpdateHeartbeatAsync(string deviceId, HeartbeatRequest request, string? ip);
+    Task<List<DeviceListItemDto>> GetAllAsync();
+    Task<DeviceDetailDto> GetDetailAsync(string deviceId);
+    Task DeactivateAsync(string deviceId);
+    Task UpdateNotesAsync(string deviceId, string notes);
+    Task<SystemStatsDto> GetStatsAsync();
 }
 
 public class DeviceService : IDeviceService
 {
-    private readonly IDeviceRepository  _deviceRepo;
+    private readonly IDeviceRepository _deviceRepo;
     private readonly ICommandRepository _commandRepo;
-    private readonly ITokenService      _tokenService;
+    private readonly ITokenService _tokenService;
     private readonly ILogger<DeviceService> _logger;
+
+    // En DeviceService.cs — agregar en constructor
+    private readonly IDbConnectionFactory _dbFactory;
 
     public DeviceService(
         IDeviceRepository deviceRepo,
         ICommandRepository commandRepo,
         ITokenService tokenService,
+        IDbConnectionFactory dbFactory,        // ← agregar
         ILogger<DeviceService> logger)
     {
-        _deviceRepo  = deviceRepo;
+        _deviceRepo = deviceRepo;
         _commandRepo = commandRepo;
         _tokenService = tokenService;
-        _logger      = logger;
+        _dbFactory = dbFactory;             // ← agregar
+        _logger = logger;
     }
 
     public async Task<(Device Device, bool IsNew)> AuthenticateOrThrowAsync(string token)
@@ -76,14 +83,14 @@ public class DeviceService : IDeviceService
         // Nuevo registro
         var device = new Device
         {
-            DeviceId       = request.DeviceId,
-            DeviceName     = request.DeviceName?.Trim(),
-            Model          = request.Model?.Trim(),
-            Manufacturer   = request.Manufacturer?.Trim(),
+            DeviceId = request.DeviceId,
+            DeviceName = request.DeviceName?.Trim(),
+            Model = request.Model?.Trim(),
+            Manufacturer = request.Manufacturer?.Trim(),
             AndroidVersion = request.AndroidVersion,
-            ApiLevel       = request.ApiLevel,
-            Token          = _tokenService.GenerateDeviceToken(),
-            IpAddress      = clientIp
+            ApiLevel = request.ApiLevel,
+            Token = _tokenService.GenerateDeviceToken(),
+            IpAddress = clientIp
         };
 
         await _deviceRepo.CreateAsync(device);
@@ -154,20 +161,11 @@ public class DeviceService : IDeviceService
         await _deviceRepo.UpdateNotesAsync(deviceId, notes);
     }
 
+
+
     public async Task<SystemStatsDto> GetStatsAsync()
     {
-        var devices  = await _deviceRepo.GetAllAsync();
-        var total    = devices.Count;
-        var online   = devices.Count(d => d.IsOnline);
-
-        // Para stats más precisas, usar el SP
-        return new SystemStatsDto(
-            TotalDevices:   total,
-            OnlineDevices:  online,
-            PendingCommands: 0,  // Se llena desde el SP en producción
-            ExecutedLast24h: 0,
-            FailedLast24h:   0,
-            ServerTime:      DateTime.UtcNow
-        );
+        using var conn = await _dbFactory.CreateConnectionAsync();
+        return await conn.QuerySingleAsync<SystemStatsDto>("EXEC dbo.sp_GetStats");
     }
 }

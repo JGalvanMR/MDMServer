@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("MDMServer")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e12587c35dd1f34be63e3a81093104d5b9fb30d6")]
 [assembly: System.Reflection.AssemblyProductAttribute("MDMServer")]
 [assembly: System.Reflection.AssemblyTitleAttribute("MDMServer")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
