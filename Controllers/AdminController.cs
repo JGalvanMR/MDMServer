@@ -12,7 +12,7 @@ namespace MDMServer.Controllers;
 [Produces("application/json")]
 public class AdminController : ControllerBase
 {
-    private readonly IDeviceService  _deviceService;
+    private readonly IDeviceService _deviceService;
     private readonly ICommandService _commandService;
     private readonly ILogger<AdminController> _logger;
 
@@ -21,9 +21,9 @@ public class AdminController : ControllerBase
         ICommandService commandService,
         ILogger<AdminController> logger)
     {
-        _deviceService  = deviceService;
+        _deviceService = deviceService;
         _commandService = commandService;
-        _logger         = logger;
+        _logger = logger;
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -37,8 +37,8 @@ public class AdminController : ControllerBase
         var devices = await _deviceService.GetAllAsync();
         return Ok(ApiResponse<object>.Ok(new
         {
-            total   = devices.Count,
-            online  = devices.Count(d => d.IsOnline),
+            total = devices.Count,
+            online = devices.Count(d => d.IsOnline),
             devices
         }, requestId: Rid()));
     }
@@ -81,11 +81,11 @@ public class AdminController : ControllerBase
     [HttpGet("devices/{deviceId}/commands")]
     public async Task<IActionResult> GetDeviceCommands(
         string deviceId,
-        [FromQuery] int page     = 1,
+        [FromQuery] int page = 1,
         [FromQuery] int pageSize = 20)
     {
         pageSize = Math.Clamp(pageSize, 1, 100);
-        page     = Math.Max(page, 1);
+        page = Math.Max(page, 1);
 
         var result = await _commandService.GetHistoryAsync(deviceId, page, pageSize);
         return Ok(ApiResponse<object>.Ok(result, requestId: Rid()));
@@ -99,7 +99,7 @@ public class AdminController : ControllerBase
     [HttpPost("commands")]
     public async Task<IActionResult> SendCommand([FromBody] SendCommandRequest request)
     {
-        var ip       = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         var response = await _commandService.SendAsync(request, ip);
         return Ok(ApiResponse<SendCommandResponse>.Ok(response, requestId: Rid()));
     }
@@ -132,7 +132,7 @@ public class AdminController : ControllerBase
         if (request.DeviceIds.Count > 100)
             return BadRequest(ApiResponse.Fail("Máximo 100 dispositivos por bulk command."));
 
-        var ip      = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         var results = new List<object>();
 
         foreach (var deviceId in request.DeviceIds)
@@ -155,8 +155,19 @@ public class AdminController : ControllerBase
 
         return Ok(ApiResponse<object>.Ok(new
         {
-            total   = results.Count,
+            total = results.Count,
             results
+        }, requestId: Rid()));
+    }
+
+    // ── GET /api/admin/ws-status ─────────────────────────────────────────────
+    [HttpGet("ws-status")]
+    public IActionResult GetWsStatus([FromServices] IWebSocketHub hub)
+    {
+        return Ok(ApiResponse<object>.Ok(new
+        {
+            onlineViaWebSocket = hub.OnlineCount,
+            connectedDeviceIds = hub.OnlineDeviceIds
         }, requestId: Rid()));
     }
 
@@ -182,8 +193,8 @@ public record UpdateNotesRequest(string? Notes);
 
 public record BulkCommandRequest(
     List<string>? DeviceIds,
-    string  CommandType,
+    string CommandType,
     string? Parameters,
-    int?    Priority,
-    int?    ExpiresInMinutes
+    int? Priority,
+    int? ExpiresInMinutes
 );

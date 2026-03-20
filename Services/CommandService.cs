@@ -9,65 +9,92 @@ namespace MDMServer.Services;
 
 public interface ICommandService
 {
-    Task<SendCommandResponse>    SendAsync(SendCommandRequest request, string createdByIp);
-    Task<PollResponse>           PollAsync(string deviceId, PollRequest request);
-    Task<bool>                   ReportResultAsync(string deviceId, CommandResultRequest request);
-    Task<CommandStatusDto>       GetStatusAsync(int commandId);
+    Task<SendCommandResponse> SendAsync(SendCommandRequest request, string createdByIp);
+    Task<PollResponse> PollAsync(string deviceId, PollRequest request);
+    Task<bool> ReportResultAsync(string deviceId, CommandResultRequest request);
+    Task<CommandStatusDto> GetStatusAsync(int commandId);
     Task<PagedResult<CommandStatusDto>> GetHistoryAsync(string deviceId, int page, int pageSize);
-    Task                         CancelAsync(int commandId, string reason);
-    Task<int>                    CancelAllPendingAsync(string deviceId);
+    Task CancelAsync(int commandId, string reason);
+    Task<int> CancelAllPendingAsync(string deviceId);
 }
 
 public class CommandService : ICommandService
 {
     private readonly ICommandRepository _commandRepo;
-    private readonly IDeviceRepository  _deviceRepo;
-    private readonly IConfiguration     _config;
+    private readonly IDeviceRepository _deviceRepo;
+    private readonly IConfiguration _config;
     private readonly ILogger<CommandService> _logger;
+    private readonly IWebSocketHub _wsHub;
 
-    public CommandService(
-        ICommandRepository commandRepo,
-        IDeviceRepository deviceRepo,
-        IConfiguration config,
-        ILogger<CommandService> logger)
+public CommandService(
+    ICommandRepository commandRepo,
+    IDeviceRepository deviceRepo,
+    IConfiguration config,
+    IWebSocketHub wsHub,          // ← agregar
+    ILogger<CommandService> logger)
+{
+    _commandRepo = commandRepo;
+    _deviceRepo  = deviceRepo;
+    _config      = config;
+    _wsHub       = wsHub;
+    _logger      = logger;
+}
+
+public async Task<SendCommandResponse> SendAsync(
+    SendCommandRequest request, string createdByIp)
+{
+    if (!await _deviceRepo.ExistsAsync(request.DeviceId))
+        throw new DeviceNotFoundException(request.DeviceId);
+
+    var command = new Command
     {
-        _commandRepo = commandRepo;
-        _deviceRepo  = deviceRepo;
-        _config      = config;
-        _logger      = logger;
-    }
+        DeviceId    = request.DeviceId,
+        CommandType = request.CommandType,
+        Parameters  = request.Parameters,
+        Priority    = request.Priority ?? 5,
+        CreatedByIp = createdByIp,
+        ExpiresAt   = request.ExpiresInMinutes.HasValue
+            ? DateTime.UtcNow.AddMinutes(request.ExpiresInMinutes.Value)
+            : null
+    };
 
-    public async Task<SendCommandResponse> SendAsync(
-        SendCommandRequest request, string createdByIp)
+    await _commandRepo.CreateAsync(command);
+
+    // ── PUSH INMEDIATO si el dispositivo está conectado por WS ───────────────
+    var pushed = false;
+    if (_wsHub.IsOnline(request.DeviceId))
     {
-        // Verificar que el dispositivo existe
-        if (!await _deviceRepo.ExistsAsync(request.DeviceId))
-            throw new DeviceNotFoundException(request.DeviceId);
+        var wsMsg = new WsCommandMessage(
+            Type:        "COMMAND",
+            CommandId:   command.Id,
+            CommandType: command.CommandType,
+            Parameters:  command.Parameters,
+            Priority:    command.Priority
+        );
+        pushed = await _wsHub.PushCommandAsync(request.DeviceId, wsMsg);
 
-        var command = new Command
+        if (pushed)
         {
-            DeviceId    = request.DeviceId,
-            CommandType = request.CommandType,
-            Parameters  = request.Parameters,
-            Priority    = request.Priority ?? 5,
-            CreatedByIp = createdByIp,
-            ExpiresAt   = request.ExpiresInMinutes.HasValue
-                ? DateTime.UtcNow.AddMinutes(request.ExpiresInMinutes.Value)
-                : null
-        };
-
-        await _commandRepo.CreateAsync(command);
-
-        _logger.LogInformation(
-            "Comando creado: Id={Id} Tipo={Type} Dispositivo={DeviceId} Priority={Priority}",
-            command.Id, command.CommandType, command.DeviceId, command.Priority
-        );
-
-        return new SendCommandResponse(
-            command.Id,
-            $"Comando {command.CommandType} encolado para {command.DeviceId}."
-        );
+            // Marcar como Sent inmediatamente
+            await _commandRepo.MarkAsSentAsync(command.Id);
+            _logger.LogInformation(
+                "Comando {Id} enviado via WS a {DeviceId}", command.Id, request.DeviceId);
+        }
     }
+
+    _logger.LogInformation(
+        "Comando creado: Id={Id} Tipo={Type} Dispositivo={DeviceId} Push={Pushed}",
+        command.Id, command.CommandType, command.DeviceId, pushed);
+
+    return new SendCommandResponse(
+        command.Id,
+        pushed
+            ? $"Comando {command.CommandType} enviado directamente al dispositivo."
+            : $"Comando {command.CommandType} encolado. Se entregará en el próximo poll."
+    );
+}
+
+
 
     public async Task<PollResponse> PollAsync(string deviceId, PollRequest request)
     {
@@ -152,8 +179,8 @@ public class CommandService : ICommandService
             throw new DeviceNotFoundException(deviceId);
 
         var commands = await _commandRepo.GetByDeviceIdAsync(deviceId, page, pageSize);
-        var total    = await _commandRepo.GetTotalCountByDeviceIdAsync(deviceId);
-        var dtos     = commands.Select(ToDto).ToList();
+        var total = await _commandRepo.GetTotalCountByDeviceIdAsync(deviceId);
+        var dtos = commands.Select(ToDto).ToList();
 
         return PagedResult<CommandStatusDto>.Create(dtos, total, page, pageSize);
     }
