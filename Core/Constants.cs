@@ -26,6 +26,7 @@ public static class MdmConstants
         public const string DisableBluetooth = "DISABLE_BLUETOOTH";
         public const string SetBrightness = "SET_BRIGHTNESS";
         public const string SendMessage = "SEND_MESSAGE";
+        public const string WakeScreen = "WAKE_SCREEN";
 
         public static readonly string[] All =
     {
@@ -33,7 +34,7 @@ public static class MdmConstants
         GetDeviceInfo, RebootDevice, WipeData, SetScreenTimeout,
         InstallApp, UninstallApp, ListApps, EnableWifi, DisableWifi, SetWifiConfig,
         ClearAppData, GetLocation, SetVolume, EnableBluetooth, DisableBluetooth,
-        SetBrightness, SendMessage
+        SetBrightness, SendMessage, WakeScreen
     };
 
         // Comandos destructivos que requieren parámetro confirm:true

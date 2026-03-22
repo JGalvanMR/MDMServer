@@ -17,10 +17,12 @@ public interface IWebSocketHub
     bool IsOnline(string deviceId);
     int OnlineCount { get; }
     IReadOnlyList<string> OnlineDeviceIds { get; }
+    event Func<string, string, Task>? OnMessageReceived;
 }
 
 public class WebSocketHub : IWebSocketHub
 {
+    public event Func<string, string, Task>? OnMessageReceived;
     private readonly ConcurrentDictionary<string, WebSocketConnection> _connections = new();
     private readonly ILogger<WebSocketHub> _logger;
     private readonly JsonSerializerOptions _jsonOpts = new()
@@ -101,24 +103,22 @@ public class WebSocketHub : IWebSocketHub
     private async Task ReceiveLoopAsync(WebSocketConnection conn, CancellationToken ct)
     {
         var buffer = new byte[4096];
-
         while (conn.IsAlive && !ct.IsCancellationRequested)
         {
             try
             {
                 var result = await conn.Ws.ReceiveAsync(buffer, ct);
-
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    await conn.Ws.CloseAsync(
-                        WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
+                    await conn.Ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
                     break;
                 }
-
                 if (result.MessageType == WebSocketMessageType.Text)
                 {
                     var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    conn.OnMessageReceived(json);
+                    // Disparar evento en lugar de conn.OnMessageReceived
+                    if (OnMessageReceived != null)
+                        await OnMessageReceived.Invoke(conn.DeviceId, json);
                 }
             }
             catch (OperationCanceledException) { break; }

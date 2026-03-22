@@ -61,46 +61,37 @@ public class DeviceService : IDeviceService
         return (device, false);
     }
 
+    // Services/DeviceService.cs — RegisterAsync con SP atómico
     public async Task<RegisterDeviceResponse> RegisterAsync(
         RegisterDeviceRequest request, string clientIp)
     {
-        // Re-registro: devolver token existente
-        var existing = await _deviceRepo.GetByDeviceIdAsync(request.DeviceId);
-        if (existing is not null)
-        {
-            _logger.LogInformation(
-                "Re-registro: DeviceId={DeviceId} IP={Ip}", request.DeviceId, clientIp);
+        using var conn = await _dbFactory.CreateConnectionAsync();
 
-            await _deviceRepo.UpdateLastSeenAsync(
-                request.DeviceId, null, null, clientIp, null, null);
+        var result = await conn.QuerySingleAsync<(string DeviceId, string Token, bool IsNew)>(@"
+        EXEC dbo.sp_UpsertDevice
+            @DeviceId, @DeviceName, @Model, @Manufacturer,
+            @AndroidVersion, @ApiLevel, @Token, @IpAddress",
+            new
+            {
+                DeviceId = request.DeviceId,
+                DeviceName = request.DeviceName?.Trim(),
+                Model = request.Model?.Trim(),
+                Manufacturer = request.Manufacturer?.Trim(),
+                AndroidVersion = request.AndroidVersion,
+                ApiLevel = request.ApiLevel,
+                Token = _tokenService.GenerateDeviceToken(),
+                IpAddress = clientIp
+            }
+        );
 
-            return new RegisterDeviceResponse(
-                existing.DeviceId, existing.Token,
-                "Dispositivo ya registrado. Token existente devuelto.", false
-            );
-        }
-
-        // Nuevo registro
-        var device = new Device
-        {
-            DeviceId = request.DeviceId,
-            DeviceName = request.DeviceName?.Trim(),
-            Model = request.Model?.Trim(),
-            Manufacturer = request.Manufacturer?.Trim(),
-            AndroidVersion = request.AndroidVersion,
-            ApiLevel = request.ApiLevel,
-            Token = _tokenService.GenerateDeviceToken(),
-            IpAddress = clientIp
-        };
-
-        await _deviceRepo.CreateAsync(device);
         _logger.LogInformation(
-            "Nuevo dispositivo registrado: {DeviceId} Modelo={Model} IP={Ip}",
-            device.DeviceId, device.Model, clientIp);
+            "{Action} dispositivo: {DeviceId} IP={Ip}",
+            result.IsNew ? "Nuevo" : "Re-registro", request.DeviceId, clientIp);
 
         return new RegisterDeviceResponse(
-            device.DeviceId, device.Token,
-            "Dispositivo registrado correctamente.", true
+            result.DeviceId, result.Token,
+            result.IsNew ? "Dispositivo registrado correctamente." : "Token existente devuelto.",
+            result.IsNew
         );
     }
 

@@ -31,11 +31,13 @@ public record CommandStatusDto(
 
 public record CancelCommandRequest(string Reason);
 
-public record SystemStatsDto(
-    int      TotalDevices,
-    int      OnlineDevices,
-    int      PendingCommands,
-    int      ExecutedLast24h,
-    int      FailedLast24h,
-    DateTime ServerTime
-);
+public class SystemStatsDto
+{
+    public int      TotalDevices        { get; set; }
+    public int      OnlineDevices       { get; set; }
+    public int      PendingCommands     { get; set; }
+    public int      ExecutedLast24h     { get; set; }
+    public int      FailedLast24h       { get; set; }
+    public double   AverageBatteryLevel { get; set; }
+    public DateTime ServerTime          { get; set; }
+}

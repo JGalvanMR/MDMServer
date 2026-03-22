@@ -72,24 +72,30 @@ public class RateLimitMiddleware
         await _next(context);
     }
 
+    // Middleware/RateLimitMiddleware.cs — reemplazar IsRateLimited
     private static bool IsRateLimited(string key, int windowSecs, int maxRequests)
     {
         var now = DateTime.UtcNow;
 
-        var entry = _counters.GetOrAdd(key, _ => (0, now));
-
-        // Ventana expirada → resetear
-        if ((now - entry.WindowStart).TotalSeconds >= windowSecs)
+        while (true)
         {
-            _counters[key] = (1, now);
-            return false;
+            var current = _counters.GetOrAdd(key, _ => (0, now));
+
+            // Ventana expirada → resetear con CAS
+            if ((now - current.WindowStart).TotalSeconds >= windowSecs)
+            {
+                var newEntry = (Count: 1, WindowStart: now);
+                if (_counters.TryUpdate(key, newEntry, current))
+                    return false;
+                continue; // retry si otro hilo actualizó primero
+            }
+
+            // Incrementar con CAS
+            var updated = (Count: current.Count + 1, current.WindowStart);
+            if (_counters.TryUpdate(key, updated, current))
+                return updated.Count > maxRequests;
+            // Si TryUpdate falla, otro hilo modificó — retry
         }
-
-        // Incrementar contador
-        var newCount = entry.Count + 1;
-        _counters[key] = (newCount, entry.WindowStart);
-
-        return newCount > maxRequests;
     }
 }
 

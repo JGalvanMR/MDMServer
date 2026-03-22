@@ -75,13 +75,13 @@ builder.Services.AddSingleton<ITokenService, TokenService>();
 builder.Services.AddScoped<IDeviceService, DeviceService>();
 builder.Services.AddScoped<ICommandService, CommandService>();
 builder.Services.AddSingleton<IWebSocketHub, WebSocketHub>();
+builder.Services.AddHostedService<CommandExpiryService>();
 
 // ══════════════════════════════════════════════════════════════════
 var app = builder.Build();
 
 // ── Pipeline ───────────────────────────────────────────────────────
 app.UseMiddleware<GlobalExceptionMiddleware>();
-app.UseMiddleware<RequestLoggingMiddleware>();
 app.UseMiddleware<RateLimitMiddleware>();
 
 if (app.Environment.IsDevelopment())
@@ -93,6 +93,14 @@ if (app.Environment.IsDevelopment())
         c.RoutePrefix = "swagger";
     });
 }
+
+app.Use(async (ctx, next) =>
+{
+    if (!ctx.Request.Headers.ContainsKey(MDMServer.Core.MdmConstants.Headers.RequestId))
+        ctx.Request.Headers[MDMServer.Core.MdmConstants.Headers.RequestId] =
+            Guid.NewGuid().ToString("N")[..12];
+    await next();
+});
 
 // app.UseHttpsRedirection(); // Deshabilitado para desarrollo local
 app.UseSerilogRequestLogging(opts =>
@@ -130,7 +138,7 @@ using (var scope = app.Services.CreateScope())
 }
 
 // ── Endpoint WS ───────────────────────────────────────────────────────────
-// Agregar al final del pipeline, antes de app.Run()
+// El hub ya tiene su propio ReceiveLoopAsync. Solo procesar mensajes via evento.
 app.MapGet("/ws/device", async (HttpContext ctx,
     IDeviceService deviceService,
     ICommandService commandService,
@@ -138,63 +146,37 @@ app.MapGet("/ws/device", async (HttpContext ctx,
     ILogger<Program> logger) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest)
-    {
-        ctx.Response.StatusCode = 400;
-        return;
-    }
+    { ctx.Response.StatusCode = 400; return; }
 
     if (!ctx.Request.Headers.TryGetValue("Device-Token", out var token))
-    {
-        ctx.Response.StatusCode = 401;
-        return;
-    }
+    { ctx.Response.StatusCode = 401; return; }
 
     MDMServer.Models.Device device;
     try
     {
-        var scope = ctx.RequestServices.CreateScope();
+        using var scope = ctx.RequestServices.CreateScope();
         var devSvc = scope.ServiceProvider.GetRequiredService<IDeviceService>();
         (device, _) = await devSvc.AuthenticateOrThrowAsync(token!);
     }
-    catch
-    {
-        ctx.Response.StatusCode = 401;
-        return;
-    }
+    catch { ctx.Response.StatusCode = 401; return; }
 
     var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-    logger.LogInformation("WebSocket conectado: {DeviceId}", device.DeviceId);
 
-    // Procesar mensajes entrantes en paralelo con el hub
+    // ── CORRECCIÓN: suscribirse al evento del hub, NO crear otro receive loop ──
     var jsonOpts = new JsonSerializerOptions
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true
     };
 
-    // Wrappear el WS para interceptar mensajes
-    var tcs = new TaskCompletionSource();
-
-    _ = Task.Run(async () =>
+    // El hub gestiona el receive loop. Nos suscribimos al evento de mensaje.
+    hub.OnMessageReceived += async (deviceId, json) =>
     {
-        var buffer = new byte[8192];
-        while (ws.State == WebSocketState.Open)
-        {
-            try
-            {
-                var result = await ws.ReceiveAsync(buffer, ctx.RequestAborted);
-                if (result.MessageType == WebSocketMessageType.Text)
-                {
-                    var json = System.Text.Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    await ProcessWsMessageAsync(json, device.DeviceId,
-                        commandService, deviceService, jsonOpts, (Serilog.ILogger)logger);
-                }
-                else if (result.MessageType == WebSocketMessageType.Close) break;
-            }
-            catch { break; }
-        }
-    });
+        if (deviceId != device.DeviceId) return;
+        await ProcessWsMessageAsync(json, deviceId, commandService, deviceService, jsonOpts);
+    };
 
+    // Bloquea hasta que la conexión cierre (el hub maneja el receive loop)
     await hub.HandleConnectionAsync(device.DeviceId, ws, ctx.RequestAborted);
 });
 
@@ -202,7 +184,7 @@ app.MapGet("/ws/device", async (HttpContext ctx,
 static async Task ProcessWsMessageAsync(
     string json, string deviceId,
     ICommandService cmdSvc, IDeviceService devSvc,
-    JsonSerializerOptions opts, Serilog.ILogger logger)
+    JsonSerializerOptions opts)
 {
     try
     {
@@ -212,20 +194,20 @@ static async Task ProcessWsMessageAsync(
         switch (type)
         {
             case "RESULT":
-                var commandId = doc.RootElement.GetProperty("commandId").GetInt32();
-                var success = doc.RootElement.GetProperty("success").GetBoolean();
-                var resultJson = doc.RootElement.TryGetProperty("resultJson", out var rj) ? rj.GetString() : null;
+                var commandId    = doc.RootElement.GetProperty("commandId").GetInt32();
+                var success      = doc.RootElement.GetProperty("success").GetBoolean();
+                var resultJson   = doc.RootElement.TryGetProperty("resultJson",   out var rj) ? rj.GetString() : null;
                 var errorMessage = doc.RootElement.TryGetProperty("errorMessage", out var em) ? em.GetString() : null;
                 await cmdSvc.ReportResultAsync(deviceId,
                     new MDMServer.DTOs.Poll.CommandResultRequest(commandId, success, resultJson, errorMessage));
                 break;
 
             case "STATUS":
-                var battery = doc.RootElement.TryGetProperty("batteryLevel", out var bat) ? (int?)bat.GetInt32() : null;
-                var storage = doc.RootElement.TryGetProperty("storageAvailableMB", out var sto) ? (long?)sto.GetInt64() : null;
-                var kiosk = doc.RootElement.TryGetProperty("kioskModeEnabled", out var ki) ? (bool?)ki.GetBoolean() : null;
-                var camOff = doc.RootElement.TryGetProperty("cameraDisabled", out var cam) ? (bool?)cam.GetBoolean() : null;
-                var ip = doc.RootElement.TryGetProperty("ipAddress", out var ipad) ? ipad.GetString() : null;
+                var battery = doc.RootElement.TryGetProperty("batteryLevel",     out var bat) ? (int?)bat.GetInt32()    : null;
+                var storage = doc.RootElement.TryGetProperty("storageAvailableMB",out var sto) ? (long?)sto.GetInt64()   : null;
+                var kiosk   = doc.RootElement.TryGetProperty("kioskModeEnabled", out var ki)  ? (bool?)ki.GetBoolean()  : null;
+                var camOff  = doc.RootElement.TryGetProperty("cameraDisabled",   out var cam) ? (bool?)cam.GetBoolean() : null;
+                var ip      = doc.RootElement.TryGetProperty("ipAddress",        out var ipad)? ipad.GetString()        : null;
                 await devSvc.UpdateHeartbeatAsync(deviceId,
                     new MDMServer.DTOs.Poll.HeartbeatRequest(battery, storage, kiosk ?? false, camOff ?? false, ip), ip);
                 break;
@@ -233,7 +215,8 @@ static async Task ProcessWsMessageAsync(
     }
     catch (Exception ex)
     {
-        logger.Debug("Error procesando WS msg de {DeviceId}: {Err}", deviceId, ex.Message);
+        // Usar el logger estático de Serilog — evita el cast fallido a Serilog.ILogger
+        Serilog.Log.Debug("Error procesando WS msg de {DeviceId}: {Err}", deviceId, ex.Message);
     }
 }
 
