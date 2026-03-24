@@ -21,6 +21,7 @@ public interface IDeviceService
     Task DeactivateAsync(string deviceId);
     Task UpdateNotesAsync(string deviceId, string notes);
     Task<SystemStatsDto> GetStatsAsync();
+    Task<bool> ExistsAsync(string deviceId);
 }
 
 public class DeviceService : IDeviceService
@@ -60,6 +61,11 @@ public class DeviceService : IDeviceService
 
         return (device, false);
     }
+
+    public async Task<bool> ExistsAsync(string deviceId)
+{
+    return await _deviceRepo.ExistsAsync(deviceId);
+}
 
     // Services/DeviceService.cs — RegisterAsync con SP atómico
     public async Task<RegisterDeviceResponse> RegisterAsync(
@@ -151,8 +157,6 @@ public class DeviceService : IDeviceService
 
         await _deviceRepo.UpdateNotesAsync(deviceId, notes);
     }
-
-
 
     public async Task<SystemStatsDto> GetStatsAsync()
     {

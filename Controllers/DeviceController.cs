@@ -4,6 +4,9 @@ using MDMServer.Core.Exceptions;
 using MDMServer.DTOs.Device;
 using MDMServer.DTOs.Poll;
 using MDMServer.Services;
+using MDMServer.DTOs.Telemetry;
+using MDMServer.Repositories;
+using MDMServer.Repositories.Interfaces;
 
 namespace MDMServer.Controllers;
 
@@ -12,7 +15,7 @@ namespace MDMServer.Controllers;
 [Produces("application/json")]
 public class DeviceController : ControllerBase
 {
-    private readonly IDeviceService  _deviceService;
+    private readonly IDeviceService _deviceService;
     private readonly ICommandService _commandService;
     private readonly ILogger<DeviceController> _logger;
 
@@ -21,9 +24,9 @@ public class DeviceController : ControllerBase
         ICommandService commandService,
         ILogger<DeviceController> logger)
     {
-        _deviceService  = deviceService;
+        _deviceService = deviceService;
         _commandService = commandService;
-        _logger         = logger;
+        _logger = logger;
     }
 
     // ── POST /api/device/register ──────────────────────────────────────────────
@@ -46,7 +49,7 @@ public class DeviceController : ControllerBase
     public async Task<IActionResult> Poll([FromBody] PollRequest request)
     {
         var (device, _) = await AuthorizeDeviceAsync();
-        var response    = await _commandService.PollAsync(device.DeviceId, request);
+        var response = await _commandService.PollAsync(device.DeviceId, request);
         return Ok(ApiResponse<PollResponse>.Ok(response, requestId: GetRequestId()));
     }
 
@@ -73,6 +76,53 @@ public class DeviceController : ControllerBase
         var (device, _) = await AuthorizeDeviceAsync();
         await _deviceService.UpdateHeartbeatAsync(device.DeviceId, request, GetClientIp());
         return Ok(ApiResponse.OkEmpty("Heartbeat OK.", GetRequestId()));
+    }
+
+    // ── POST /api/device/telemetry ─────────────────────────────────────────────
+    /// <summary>El dispositivo reporta telemetría enriquecida periódicamente.</summary>
+    [HttpPost("telemetry")]
+    [ProducesResponseType(typeof(ApiResponse), 200)]
+    [ProducesResponseType(typeof(ApiResponse), 401)]
+    public async Task<IActionResult> ReportTelemetry(
+        [FromBody] TelemetryReportRequest request,
+        [FromServices] ITelemetryRepository telemetryRepo,
+        [FromServices] IGeofenceService geofenceService)
+    {
+        var (device, _) = await AuthorizeDeviceAsync();
+
+        // Guardar telemetría
+        await telemetryRepo.SaveTelemetryAsync(device.DeviceId, request);
+
+        // Actualizar LastSeen con los datos básicos (aprovechar lo existente)
+        await _deviceService.UpdateHeartbeatAsync(device.DeviceId,
+            new HeartbeatRequest(
+                request.BatteryLevel,
+                request.StorageAvailableMB,
+                request.KioskModeEnabled,
+                request.CameraDisabled,
+                request.IpAddress
+            ), request.IpAddress);
+
+        // ═══ NUEVO: Verificar geofences si hay ubicación ═══
+        if (request.Latitude.HasValue && request.Longitude.HasValue)
+        {
+            var geofenceResult = await geofenceService.CheckLocationAsync(
+                device.DeviceId,
+                (decimal)request.Latitude.Value,
+                (decimal)request.Longitude.Value,
+                request.LocationAccuracy);
+            
+            // Si hay eventos triggered, podrías enviar notificaciones aquí
+            if (geofenceResult.TriggeredEvents.Any())
+            {
+                _logger.LogInformation(
+                    "Geofence events triggered for {DeviceId}: {Events}",
+                    device.DeviceId,
+                    string.Join(", ", geofenceResult.TriggeredEvents));
+            }
+        }
+
+        return Ok(ApiResponse.OkEmpty("Telemetría registrada.", GetRequestId()));
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────

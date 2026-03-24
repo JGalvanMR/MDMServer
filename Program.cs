@@ -74,8 +74,11 @@ builder.Services.AddScoped<ICommandRepository, CommandRepository>();
 builder.Services.AddSingleton<ITokenService, TokenService>();
 builder.Services.AddScoped<IDeviceService, DeviceService>();
 builder.Services.AddScoped<ICommandService, CommandService>();
+builder.Services.AddScoped<IGeofenceRepository, GeofenceRepository>();
+builder.Services.AddScoped<IGeofenceService, GeofenceService>();
 builder.Services.AddSingleton<IWebSocketHub, WebSocketHub>();
 builder.Services.AddHostedService<CommandExpiryService>();
+builder.Services.AddScoped<ITelemetryRepository, TelemetryRepository>();
 
 // ══════════════════════════════════════════════════════════════════
 var app = builder.Build();

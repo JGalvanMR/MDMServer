@@ -27,6 +27,16 @@ public static class MdmConstants
         public const string SetBrightness = "SET_BRIGHTNESS";
         public const string SendMessage = "SEND_MESSAGE";
         public const string WakeScreen = "WAKE_SCREEN";
+        public const string TakeScreenshot = "TAKE_SCREENSHOT";
+        public const string GetLogs = "GET_LOGS";
+        public const string GetAppUsage = "GET_APP_USAGE";
+        public const string GetNetworkInfo = "GET_NETWORK_INFO";
+        public const string PushConfig = "PUSH_CONFIG";
+        public const string StartLocationTrack = "START_LOCATION_TRACK";
+        public const string StopLocationTrack = "STOP_LOCATION_TRACK";
+        public const string RingDevice = "RING_DEVICE";
+        public const string SetPasswordPolicy = "SET_PASSWORD_POLICY";
+        public const string GetBatteryDetail = "GET_BATTERY_DETAIL";
 
         public static readonly string[] All =
     {
@@ -34,7 +44,9 @@ public static class MdmConstants
         GetDeviceInfo, RebootDevice, WipeData, SetScreenTimeout,
         InstallApp, UninstallApp, ListApps, EnableWifi, DisableWifi, SetWifiConfig,
         ClearAppData, GetLocation, SetVolume, EnableBluetooth, DisableBluetooth,
-        SetBrightness, SendMessage, WakeScreen
+        SetBrightness, SendMessage, WakeScreen,TakeScreenshot, GetLogs, GetAppUsage,
+        GetNetworkInfo, PushConfig, StartLocationTrack, StopLocationTrack, RingDevice,
+        SetPasswordPolicy, GetBatteryDetail
     };
 
         // Comandos destructivos que requieren parámetro confirm:true
