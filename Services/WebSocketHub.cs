@@ -18,13 +18,20 @@ public interface IWebSocketHub
     int OnlineCount { get; }
     IReadOnlyList<string> OnlineDeviceIds { get; }
     event Func<string, string, Task>? OnMessageReceived;
+    event Func<string, string, Task>? OnMessageText;      // rename (era OnMessageReceived)
+    event Func<string, byte[], Task>? OnMessageBinary;   // nuevo
+    Task<bool> SendTextAsync(string deviceId, string text);   // nuevo
+    Task<bool> SendBinaryToViewer(string deviceId, byte[] data); // nuevo
 }
 
 public class WebSocketHub : IWebSocketHub
 {
+    public event Func<string, string, Task>? OnMessageText;
+    public event Func<string, byte[], Task>? OnMessageBinary;
     public event Func<string, string, Task>? OnMessageReceived;
     private readonly ConcurrentDictionary<string, WebSocketConnection> _connections = new();
     private readonly ILogger<WebSocketHub> _logger;
+    private readonly StreamingConnectionManager _connMgr;
     private readonly JsonSerializerOptions _jsonOpts = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
@@ -37,7 +44,12 @@ public class WebSocketHub : IWebSocketHub
     private const int BufferSize = 524288; // 512KB
     private const int MaxMessageSize = 5 * 1024 * 1024; // 5MB límite
 
-    public WebSocketHub(ILogger<WebSocketHub> logger) => _logger = logger;
+    public WebSocketHub(ILogger<WebSocketHub> logger, StreamingConnectionManager connMgr)
+    {
+        _logger = logger;
+        _connMgr = connMgr;
+    }
+
 
     public int OnlineCount => _connections.Count(c => c.Value.IsAlive);
 
@@ -104,8 +116,62 @@ public class WebSocketHub : IWebSocketHub
         }
     }
 
-
     private async Task ReceiveLoopAsync(WebSocketConnection conn, CancellationToken ct)
+    {
+        var buffer = new byte[524288]; // 512KB
+        while (conn.IsAlive && !ct.IsCancellationRequested)
+        {
+            try
+            {
+                var result = await conn.Ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    await conn.Ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
+                    return;
+                }
+
+                if (result.MessageType == WebSocketMessageType.Text)
+                {
+                    var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                    if (OnMessageText != null)
+                        await OnMessageText.Invoke(conn.DeviceId, text);
+                }
+                else if (result.MessageType == WebSocketMessageType.Binary)
+                {
+                    var data = new byte[result.Count];
+                    Array.Copy(buffer, data, result.Count);
+                    if (OnMessageBinary != null)
+                        await OnMessageBinary.Invoke(conn.DeviceId, data);
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (WebSocketException ex)
+            {
+                _logger.LogDebug("WS error {DeviceId}: {Msg}", conn.DeviceId, ex.Message);
+                break;
+            }
+        }
+    }
+
+    public async Task<bool> SendTextAsync(string deviceId, string text)
+    {
+        if (!_connections.TryGetValue(deviceId, out var conn) || !conn.IsAlive)
+            return false;
+        var bytes = Encoding.UTF8.GetBytes(text);
+        await conn.SendAsync(bytes, WebSocketMessageType.Text, true);
+        return true;
+    }
+
+    public async Task<bool> SendBinaryToViewer(string deviceId, byte[] data)
+    {
+        var ws = _connMgr.GetViewerForDevice(deviceId);
+        if (ws == null || ws.State != WebSocketState.Open)
+            return false;
+        await ws.SendAsync(data, WebSocketMessageType.Binary, true, CancellationToken.None);
+        return true;
+    }
+
+    private async Task ReceiveLoopAsyncOG(WebSocketConnection conn, CancellationToken ct)
     {
         var buffer = new byte[BufferSize];
         var messageBuilder = new StringBuilder();
@@ -141,6 +207,12 @@ public class WebSocketHub : IWebSocketHub
                             messageBuilder.Clear();
                             break;
                         }
+                    }
+                    else if (result.MessageType == WebSocketMessageType.Binary)
+                    {
+                        var data = buffer.Take(result.Count).ToArray();
+                        if (OnMessageBinary != null)
+                            await OnMessageBinary.Invoke(conn.DeviceId, data);
                     }
                 }
                 while (!result.EndOfMessage);

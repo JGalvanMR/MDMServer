@@ -11,13 +11,13 @@ using MDMServer.Services.Interfaces;
 using MDMServer.Validators;
 using System.Net.WebSockets;
 using System.Text.Json;
+using System.Text;
+using MDMServer.Models;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // ── CORRECCIÓN: logs duplicados ───────────────────────────────────────────────
-// builder.Host.UseSerilog() reemplaza el ILoggerFactory de Serilog pero NO
-// elimina los proveedores por defecto de ASP.NET Core (Console, Debug).
-// Sin ClearProviders(), ambos proveedores escriben cada mensaje → duplicados.
 builder.Logging.ClearProviders();
 
 // ── Serilog ───────────────────────────────────────────────────────────────────
@@ -45,22 +45,22 @@ builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new()
     {
-        Title       = "MDM Server API",
-        Version     = "v1",
+        Title = "MDM Server API",
+        Version = "v1",
         Description = "API de administración remota de dispositivos Android"
     });
     c.AddSecurityDefinition("DeviceToken", new()
     {
-        Type        = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
-        In          = Microsoft.OpenApi.Models.ParameterLocation.Header,
-        Name        = "Device-Token",
+        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
+        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Name = "Device-Token",
         Description = "Token del dispositivo (obtenido al registrar)"
     });
     c.AddSecurityDefinition("AdminKey", new()
     {
-        Type        = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
-        In          = Microsoft.OpenApi.Models.ParameterLocation.Header,
-        Name        = "X-Admin-Key",
+        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
+        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Name = "X-Admin-Key",
         Description = "Clave del administrador"
     });
 });
@@ -82,9 +82,10 @@ builder.Services.AddScoped<IDeviceService, DeviceService>();
 builder.Services.AddScoped<ICommandService, CommandService>();
 builder.Services.AddScoped<IGeofenceRepository, GeofenceRepository>();
 builder.Services.AddScoped<IGeofenceService, GeofenceService>();
-builder.Services.AddSingleton<IWebSocketHub, WebSocketHub>();
 builder.Services.AddHostedService<CommandExpiryService>();
 builder.Services.AddScoped<ITelemetryRepository, TelemetryRepository>();
+builder.Services.AddSingleton<StreamingConnectionManager>();
+builder.Services.AddSingleton<IWebSocketHub, WebSocketHub>(); // <-- asegurar registro
 
 // ══════════════════════════════════════════════════════════════════════════════
 var app = builder.Build();
@@ -144,13 +145,26 @@ using (var scope = app.Services.CreateScope())
     }
 }
 
-// ── Endpoint WebSocket ────────────────────────────────────────────────────────
-app.MapGet("/ws/device", async (
+// ── Endpoint WebSocket para dispositivos (método estático) ────────────────────
+app.MapGet("/ws/device", HandleDeviceWebSocket);
+
+// ── Endpoint WebSocket para viewers (método estático) ─────────────────────────
+app.MapGet("/ws/viewer", HandleViewerWebSocket);
+
+Log.Information("MDM Server listo en {Urls}", string.Join(", ", app.Urls));
+await app.RunAsync();
+return 0;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// MÉTODOS ESTÁTICOS PARA WEBSOCKETS
+// ──────────────────────────────────────────────────────────────────────────────
+
+static async Task HandleDeviceWebSocket(
     HttpContext ctx,
-    IDeviceService deviceService,
-    ICommandService commandService,
-    IWebSocketHub hub,
-    ILogger<Program> logger) =>
+    [FromServices] IDeviceService deviceService,
+    [FromServices] ICommandService commandService,
+    [FromServices] IWebSocketHub hub,
+    [FromServices] ILogger<Program> logger)
 {
     if (!ctx.WebSockets.IsWebSocketRequest)
     {
@@ -181,52 +195,103 @@ app.MapGet("/ws/device", async (
 
     var jsonOpts = new JsonSerializerOptions
     {
-        PropertyNamingPolicy    = JsonNamingPolicy.CamelCase,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true
     };
 
-    // ── CORRECCIÓN: fuga de event handlers ────────────────────────────────────
-    //
-    // PROBLEMA ORIGINAL:
-    //   hub.OnMessageReceived += async (deviceId, json) => { ... };
-    //   await hub.HandleConnectionAsync(...);
-    //   // El handler NUNCA se desuscribía.
-    //
-    // Consecuencia: con cada reconexión del mismo dispositivo se acumulaba un
-    // handler adicional. Tras N reconexiones, N handlers estaban activos.
-    // N-1 de ellos ejecutaban el `if (deviceId != device.DeviceId) return`
-    // pero aún así el GC no podía recolectar las closures ni los objetos
-    // capturados (device, commandService, deviceService). En ejecución continua
-    // esto degradaba el servidor progresivamente.
-    //
-    // CORRECCIÓN:
-    //   Guardar referencia explícita al delegate y desuscribirse en el finally.
-    //   El bloque try/finally garantiza la desuscripción incluso si la conexión
-    //   cierra por error, cancelación o excepción no controlada.
+    // Función handler para mensajes de texto (evento OnMessageText)
     Func<string, string, Task> messageHandler = async (deviceId, json) =>
     {
         if (deviceId != device.DeviceId) return;
         await ProcessWsMessageAsync(json, deviceId, commandService, deviceService, jsonOpts);
     };
 
-    hub.OnMessageReceived += messageHandler;
+    // Suscribirse al evento OnMessageText
+    hub.OnMessageText += messageHandler;
     try
     {
-        // Bloquea hasta que la conexión WS cierre (el hub gestiona el receive loop)
         await hub.HandleConnectionAsync(device.DeviceId, ws, ctx.RequestAborted);
     }
     finally
     {
-        // Siempre se ejecuta: conexión cerrada limpiamente, por timeout,
-        // por CancellationToken o por excepción.
-        hub.OnMessageReceived -= messageHandler;
+        hub.OnMessageText -= messageHandler;
         logger.LogDebug(
             "Handler WS desuscrito para {DeviceId}. Conexiones activas: {Count}",
             device.DeviceId, hub.OnlineCount);
     }
-});
+}
 
-// ── Helper local ──────────────────────────────────────────────────────────────
+static async Task HandleViewerWebSocket(
+    HttpContext ctx,
+    [FromServices] IDeviceService deviceService,
+    [FromServices] IWebSocketHub deviceHub,
+    [FromServices] StreamingConnectionManager connMgr,
+    [FromServices] ILogger<Program> logger)
+{
+    if (!ctx.WebSockets.IsWebSocketRequest)
+    {
+        ctx.Response.StatusCode = 400;
+        return;
+    }
+
+    var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+    var viewerId = Guid.NewGuid().ToString();
+    connMgr.AddViewer(viewerId, ws);
+
+    var buffer = new byte[4096];
+    try
+    {
+        while (ws.State == WebSocketState.Open)
+        {
+            var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ctx.RequestAborted);
+            if (result.MessageType == WebSocketMessageType.Close) break;
+
+            if (result.MessageType == WebSocketMessageType.Text)
+            {
+                var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                var msg = JsonSerializer.Deserialize<ViewerMessage>(text);
+                if (msg?.Type == "auth")
+                {
+                    var config = ctx.RequestServices.GetRequiredService<IConfiguration>();
+                    var expectedKey = config["Mdm:AdminApiKey"];
+                    if (msg.AdminKey != expectedKey)
+                    {
+                        await ws.SendAsync(Encoding.UTF8.GetBytes("{\"error\":\"Invalid admin key\"}"),
+                            WebSocketMessageType.Text, true, CancellationToken.None);
+                        break;
+                    }
+                }
+                else if (msg?.Type == "watch")
+                {
+                    var deviceId = msg.DeviceId;
+                    if (!await deviceService.ExistsAsync(deviceId))
+                    {
+                        await ws.SendAsync(Encoding.UTF8.GetBytes("{\"error\":\"Device not found\"}"),
+                            WebSocketMessageType.Text, true, CancellationToken.None);
+                        continue;
+                    }
+                    connMgr.MapViewerToDevice(viewerId, deviceId);
+                    await ws.SendAsync(Encoding.UTF8.GetBytes("{\"status\":\"watching\"}"),
+                        WebSocketMessageType.Text, true, CancellationToken.None);
+                }
+                else if (msg?.Type == "input")
+                {
+                    var deviceId = connMgr.GetDeviceForViewer(viewerId);
+                    if (deviceId != null && deviceHub.IsOnline(deviceId))
+                    {
+                        await deviceHub.SendTextAsync(deviceId, text);
+                    }
+                }
+            }
+        }
+    }
+    finally
+    {
+        connMgr.RemoveViewer(viewerId);
+        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
+    }
+}
+
 static async Task ProcessWsMessageAsync(
     string json,
     string deviceId,
@@ -236,15 +301,15 @@ static async Task ProcessWsMessageAsync(
 {
     try
     {
-        using var doc  = JsonDocument.Parse(json);
+        using var doc = JsonDocument.Parse(json);
         var type = doc.RootElement.GetProperty("type").GetString()?.ToUpper();
 
         switch (type)
         {
             case "RESULT":
-                var commandId    = doc.RootElement.GetProperty("commandId").GetInt32();
-                var success      = doc.RootElement.GetProperty("success").GetBoolean();
-                var resultJson   = doc.RootElement.TryGetProperty("resultJson",   out var rj) ? rj.GetString() : null;
+                var commandId = doc.RootElement.GetProperty("commandId").GetInt32();
+                var success = doc.RootElement.GetProperty("success").GetBoolean();
+                var resultJson = doc.RootElement.TryGetProperty("resultJson", out var rj) ? rj.GetString() : null;
                 var errorMessage = doc.RootElement.TryGetProperty("errorMessage", out var em) ? em.GetString() : null;
                 await cmdSvc.ReportResultAsync(deviceId,
                     new MDMServer.DTOs.Poll.CommandResultRequest(
@@ -252,11 +317,11 @@ static async Task ProcessWsMessageAsync(
                 break;
 
             case "STATUS":
-                var battery = doc.RootElement.TryGetProperty("batteryLevel",      out var bat) ? (int?)bat.GetInt32()   : null;
-                var storage = doc.RootElement.TryGetProperty("storageAvailableMB", out var sto) ? (long?)sto.GetInt64()  : null;
-                var kiosk   = doc.RootElement.TryGetProperty("kioskModeEnabled",  out var ki)  ? (bool?)ki.GetBoolean() : null;
-                var camOff  = doc.RootElement.TryGetProperty("cameraDisabled",    out var cam) ? (bool?)cam.GetBoolean(): null;
-                var ip      = doc.RootElement.TryGetProperty("ipAddress",         out var ipad)? ipad.GetString()       : null;
+                var battery = doc.RootElement.TryGetProperty("batteryLevel", out var bat) ? (int?)bat.GetInt32() : null;
+                var storage = doc.RootElement.TryGetProperty("storageAvailableMB", out var sto) ? (long?)sto.GetInt64() : null;
+                var kiosk = doc.RootElement.TryGetProperty("kioskModeEnabled", out var ki) ? (bool?)ki.GetBoolean() : null;
+                var camOff = doc.RootElement.TryGetProperty("cameraDisabled", out var cam) ? (bool?)cam.GetBoolean() : null;
+                var ip = doc.RootElement.TryGetProperty("ipAddress", out var ipad) ? ipad.GetString() : null;
                 await devSvc.UpdateHeartbeatAsync(deviceId,
                     new MDMServer.DTOs.Poll.HeartbeatRequest(
                         battery, storage, kiosk ?? false, camOff ?? false, ip), ip);
@@ -278,7 +343,3 @@ static async Task ProcessWsMessageAsync(
             "Error procesando WS msg de {DeviceId}: {Err}", deviceId, ex.Message);
     }
 }
-
-Log.Information("MDM Server listo en {Urls}", string.Join(", ", app.Urls));
-app.Run();
-return 0;

@@ -37,6 +37,9 @@ public static class MdmConstants
         public const string RingDevice = "RING_DEVICE";
         public const string SetPasswordPolicy = "SET_PASSWORD_POLICY";
         public const string GetBatteryDetail = "GET_BATTERY_DETAIL";
+        public const string StartScreenStream = "START_SCREEN_STREAM";
+        public const string StopScreenStream = "STOP_SCREEN_STREAM";
+		public const string GrantScreenCapture = "GRANT_SCREEN_CAPTURE";
 
         public static readonly string[] All =
     {
@@ -46,7 +49,8 @@ public static class MdmConstants
         ClearAppData, GetLocation, SetVolume, EnableBluetooth, DisableBluetooth,
         SetBrightness, SendMessage, WakeScreen,TakeScreenshot, GetLogs, GetAppUsage,
         GetNetworkInfo, PushConfig, StartLocationTrack, StopLocationTrack, RingDevice,
-        SetPasswordPolicy, GetBatteryDetail
+        SetPasswordPolicy, GetBatteryDetail,StartScreenStream,
+        StopScreenStream, GrantScreenCapture
     };
 
         // Comandos destructivos que requieren parámetro confirm:true
