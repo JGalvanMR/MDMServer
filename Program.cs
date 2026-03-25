@@ -14,7 +14,13 @@ using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ── Serilog — configuración única, sin bootstrap ──────────────────
+// ── CORRECCIÓN: logs duplicados ───────────────────────────────────────────────
+// builder.Host.UseSerilog() reemplaza el ILoggerFactory de Serilog pero NO
+// elimina los proveedores por defecto de ASP.NET Core (Console, Debug).
+// Sin ClearProviders(), ambos proveedores escriben cada mensaje → duplicados.
+builder.Logging.ClearProviders();
+
+// ── Serilog ───────────────────────────────────────────────────────────────────
 builder.Host.UseSerilog((ctx, services, config) =>
     config
         .ReadFrom.Configuration(ctx.Configuration)
@@ -24,7 +30,7 @@ builder.Host.UseSerilog((ctx, services, config) =>
             "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
 );
 
-// ── Controllers y validación ──────────────────────────────────────
+// ── Controllers y validación ──────────────────────────────────────────────────
 builder.Services
     .AddControllers(opts => opts.Filters.Add<ValidateModelAttribute>())
     .ConfigureApiBehaviorOptions(opts =>
@@ -33,41 +39,41 @@ builder.Services
 builder.Services.AddFluentValidationAutoValidation();
 builder.Services.AddValidatorsFromAssemblyContaining<RegisterDeviceValidator>();
 
-// ── Swagger ────────────────────────────────────────────────────────
+// ── Swagger ───────────────────────────────────────────────────────────────────
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new()
     {
-        Title = "MDM Server API",
-        Version = "v1",
+        Title       = "MDM Server API",
+        Version     = "v1",
         Description = "API de administración remota de dispositivos Android"
     });
     c.AddSecurityDefinition("DeviceToken", new()
     {
-        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
-        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
-        Name = "Device-Token",
+        Type        = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
+        In          = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Name        = "Device-Token",
         Description = "Token del dispositivo (obtenido al registrar)"
     });
     c.AddSecurityDefinition("AdminKey", new()
     {
-        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
-        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
-        Name = "X-Admin-Key",
+        Type        = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
+        In          = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Name        = "X-Admin-Key",
         Description = "Clave del administrador"
     });
 });
 
-// ── CORS ───────────────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
 builder.Services.AddCors(opts =>
     opts.AddDefaultPolicy(p =>
         p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
 
-// ── Health Checks ──────────────────────────────────────────────────
+// ── Health Checks ─────────────────────────────────────────────────────────────
 builder.Services.AddHealthChecks();
 
-// ── DI ─────────────────────────────────────────────────────────────
+// ── DI ────────────────────────────────────────────────────────────────────────
 builder.Services.AddSingleton<IDbConnectionFactory, SqlConnectionFactory>();
 builder.Services.AddScoped<IDeviceRepository, DeviceRepository>();
 builder.Services.AddScoped<ICommandRepository, CommandRepository>();
@@ -80,10 +86,10 @@ builder.Services.AddSingleton<IWebSocketHub, WebSocketHub>();
 builder.Services.AddHostedService<CommandExpiryService>();
 builder.Services.AddScoped<ITelemetryRepository, TelemetryRepository>();
 
-// ══════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 var app = builder.Build();
 
-// ── Pipeline ───────────────────────────────────────────────────────
+// ── Pipeline ──────────────────────────────────────────────────────────────────
 app.UseMiddleware<GlobalExceptionMiddleware>();
 app.UseMiddleware<RateLimitMiddleware>();
 
@@ -105,10 +111,8 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-// app.UseHttpsRedirection(); // Deshabilitado para desarrollo local
 app.UseSerilogRequestLogging(opts =>
 {
-    // Silenciar heartbeat y health del log de requests (muy frecuentes)
     opts.GetLevel = (ctx, _, _) =>
         ctx.Request.Path.StartsWithSegments("/health") ||
         ctx.Request.Path.StartsWithSegments("/api/device/heartbeat")
@@ -116,7 +120,7 @@ app.UseSerilogRequestLogging(opts =>
             : Serilog.Events.LogEventLevel.Information;
 });
 
-// ── WebSocket ──────────────────────────────────────────────────────────────
+// ── WebSocket ─────────────────────────────────────────────────────────────────
 app.UseWebSockets(new WebSocketOptions
 {
     KeepAliveInterval = TimeSpan.FromSeconds(30)
@@ -126,7 +130,7 @@ app.UseCors();
 app.MapHealthChecks("/health");
 app.MapControllers();
 
-// ── Verificar DB al arrancar ───────────────────────────────────────
+// ── Verificar DB al arrancar ──────────────────────────────────────────────────
 using (var scope = app.Services.CreateScope())
 {
     var factory = scope.ServiceProvider.GetRequiredService<IDbConnectionFactory>();
@@ -140,19 +144,25 @@ using (var scope = app.Services.CreateScope())
     }
 }
 
-// ── Endpoint WS ───────────────────────────────────────────────────────────
-// El hub ya tiene su propio ReceiveLoopAsync. Solo procesar mensajes via evento.
-app.MapGet("/ws/device", async (HttpContext ctx,
+// ── Endpoint WebSocket ────────────────────────────────────────────────────────
+app.MapGet("/ws/device", async (
+    HttpContext ctx,
     IDeviceService deviceService,
     ICommandService commandService,
     IWebSocketHub hub,
     ILogger<Program> logger) =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest)
-    { ctx.Response.StatusCode = 400; return; }
+    {
+        ctx.Response.StatusCode = 400;
+        return;
+    }
 
     if (!ctx.Request.Headers.TryGetValue("Device-Token", out var token))
-    { ctx.Response.StatusCode = 401; return; }
+    {
+        ctx.Response.StatusCode = 401;
+        return;
+    }
 
     MDMServer.Models.Device device;
     try
@@ -161,37 +171,72 @@ app.MapGet("/ws/device", async (HttpContext ctx,
         var devSvc = scope.ServiceProvider.GetRequiredService<IDeviceService>();
         (device, _) = await devSvc.AuthenticateOrThrowAsync(token!);
     }
-    catch { ctx.Response.StatusCode = 401; return; }
+    catch
+    {
+        ctx.Response.StatusCode = 401;
+        return;
+    }
 
     var ws = await ctx.WebSockets.AcceptWebSocketAsync();
 
-    // ── CORRECCIÓN: suscribirse al evento del hub, NO crear otro receive loop ──
     var jsonOpts = new JsonSerializerOptions
     {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNamingPolicy    = JsonNamingPolicy.CamelCase,
         PropertyNameCaseInsensitive = true
     };
 
-    // El hub gestiona el receive loop. Nos suscribimos al evento de mensaje.
-    hub.OnMessageReceived += async (deviceId, json) =>
+    // ── CORRECCIÓN: fuga de event handlers ────────────────────────────────────
+    //
+    // PROBLEMA ORIGINAL:
+    //   hub.OnMessageReceived += async (deviceId, json) => { ... };
+    //   await hub.HandleConnectionAsync(...);
+    //   // El handler NUNCA se desuscribía.
+    //
+    // Consecuencia: con cada reconexión del mismo dispositivo se acumulaba un
+    // handler adicional. Tras N reconexiones, N handlers estaban activos.
+    // N-1 de ellos ejecutaban el `if (deviceId != device.DeviceId) return`
+    // pero aún así el GC no podía recolectar las closures ni los objetos
+    // capturados (device, commandService, deviceService). En ejecución continua
+    // esto degradaba el servidor progresivamente.
+    //
+    // CORRECCIÓN:
+    //   Guardar referencia explícita al delegate y desuscribirse en el finally.
+    //   El bloque try/finally garantiza la desuscripción incluso si la conexión
+    //   cierra por error, cancelación o excepción no controlada.
+    Func<string, string, Task> messageHandler = async (deviceId, json) =>
     {
         if (deviceId != device.DeviceId) return;
         await ProcessWsMessageAsync(json, deviceId, commandService, deviceService, jsonOpts);
     };
 
-    // Bloquea hasta que la conexión cierre (el hub maneja el receive loop)
-    await hub.HandleConnectionAsync(device.DeviceId, ws, ctx.RequestAborted);
+    hub.OnMessageReceived += messageHandler;
+    try
+    {
+        // Bloquea hasta que la conexión WS cierre (el hub gestiona el receive loop)
+        await hub.HandleConnectionAsync(device.DeviceId, ws, ctx.RequestAborted);
+    }
+    finally
+    {
+        // Siempre se ejecuta: conexión cerrada limpiamente, por timeout,
+        // por CancellationToken o por excepción.
+        hub.OnMessageReceived -= messageHandler;
+        logger.LogDebug(
+            "Handler WS desuscrito para {DeviceId}. Conexiones activas: {Count}",
+            device.DeviceId, hub.OnlineCount);
+    }
 });
 
-// Helper local
+// ── Helper local ──────────────────────────────────────────────────────────────
 static async Task ProcessWsMessageAsync(
-    string json, string deviceId,
-    ICommandService cmdSvc, IDeviceService devSvc,
+    string json,
+    string deviceId,
+    ICommandService cmdSvc,
+    IDeviceService devSvc,
     JsonSerializerOptions opts)
 {
     try
     {
-        using var doc = JsonDocument.Parse(json);
+        using var doc  = JsonDocument.Parse(json);
         var type = doc.RootElement.GetProperty("type").GetString()?.ToUpper();
 
         switch (type)
@@ -202,24 +247,35 @@ static async Task ProcessWsMessageAsync(
                 var resultJson   = doc.RootElement.TryGetProperty("resultJson",   out var rj) ? rj.GetString() : null;
                 var errorMessage = doc.RootElement.TryGetProperty("errorMessage", out var em) ? em.GetString() : null;
                 await cmdSvc.ReportResultAsync(deviceId,
-                    new MDMServer.DTOs.Poll.CommandResultRequest(commandId, success, resultJson, errorMessage));
+                    new MDMServer.DTOs.Poll.CommandResultRequest(
+                        commandId, success, resultJson, errorMessage));
                 break;
 
             case "STATUS":
-                var battery = doc.RootElement.TryGetProperty("batteryLevel",     out var bat) ? (int?)bat.GetInt32()    : null;
-                var storage = doc.RootElement.TryGetProperty("storageAvailableMB",out var sto) ? (long?)sto.GetInt64()   : null;
-                var kiosk   = doc.RootElement.TryGetProperty("kioskModeEnabled", out var ki)  ? (bool?)ki.GetBoolean()  : null;
-                var camOff  = doc.RootElement.TryGetProperty("cameraDisabled",   out var cam) ? (bool?)cam.GetBoolean() : null;
-                var ip      = doc.RootElement.TryGetProperty("ipAddress",        out var ipad)? ipad.GetString()        : null;
+                var battery = doc.RootElement.TryGetProperty("batteryLevel",      out var bat) ? (int?)bat.GetInt32()   : null;
+                var storage = doc.RootElement.TryGetProperty("storageAvailableMB", out var sto) ? (long?)sto.GetInt64()  : null;
+                var kiosk   = doc.RootElement.TryGetProperty("kioskModeEnabled",  out var ki)  ? (bool?)ki.GetBoolean() : null;
+                var camOff  = doc.RootElement.TryGetProperty("cameraDisabled",    out var cam) ? (bool?)cam.GetBoolean(): null;
+                var ip      = doc.RootElement.TryGetProperty("ipAddress",         out var ipad)? ipad.GetString()       : null;
                 await devSvc.UpdateHeartbeatAsync(deviceId,
-                    new MDMServer.DTOs.Poll.HeartbeatRequest(battery, storage, kiosk ?? false, camOff ?? false, ip), ip);
+                    new MDMServer.DTOs.Poll.HeartbeatRequest(
+                        battery, storage, kiosk ?? false, camOff ?? false, ip), ip);
+                break;
+
+            // PONG y otros tipos conocidos: ignorar silenciosamente
+            case "PONG":
+                break;
+
+            default:
+                Serilog.Log.Debug(
+                    "Mensaje WS desconocido tipo={Type} de {DeviceId}", type, deviceId);
                 break;
         }
     }
     catch (Exception ex)
     {
-        // Usar el logger estático de Serilog — evita el cast fallido a Serilog.ILogger
-        Serilog.Log.Debug("Error procesando WS msg de {DeviceId}: {Err}", deviceId, ex.Message);
+        Serilog.Log.Debug(
+            "Error procesando WS msg de {DeviceId}: {Err}", deviceId, ex.Message);
     }
 }
 

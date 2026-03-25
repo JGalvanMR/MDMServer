@@ -33,6 +33,10 @@ public class WebSocketHub : IWebSocketHub
     // Ping cada 30s para mantener la conexión viva
     private const int PingIntervalSeconds = 30;
 
+    // Aumentar a 512KB para manejar screenshots base64
+    private const int BufferSize = 524288; // 512KB
+    private const int MaxMessageSize = 5 * 1024 * 1024; // 5MB límite
+
     public WebSocketHub(ILogger<WebSocketHub> logger) => _logger = logger;
 
     public int OnlineCount => _connections.Count(c => c.Value.IsAlive);
@@ -100,25 +104,51 @@ public class WebSocketHub : IWebSocketHub
         }
     }
 
+
     private async Task ReceiveLoopAsync(WebSocketConnection conn, CancellationToken ct)
     {
-        var buffer = new byte[4096];
+        var buffer = new byte[BufferSize];
+        var messageBuilder = new StringBuilder();
+
         while (conn.IsAlive && !ct.IsCancellationRequested)
         {
             try
             {
-                var result = await conn.Ws.ReceiveAsync(buffer, ct);
-                if (result.MessageType == WebSocketMessageType.Close)
+                WebSocketReceiveResult result;
+                messageBuilder.Clear();
+
+                do
                 {
-                    await conn.Ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
-                    break;
+                    result = await conn.Ws.ReceiveAsync(
+                        new ArraySegment<byte>(buffer), ct);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        await conn.Ws.CloseAsync(
+                            WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
+                        return;
+                    }
+
+                    if (result.MessageType == WebSocketMessageType.Text)
+                    {
+                        var chunk = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                        messageBuilder.Append(chunk);
+
+                        // Protección contra mensajes enormes
+                        if (messageBuilder.Length > MaxMessageSize)
+                        {
+                            _logger.LogError("Mensaje WS excede 5MB, descartando");
+                            messageBuilder.Clear();
+                            break;
+                        }
+                    }
                 }
-                if (result.MessageType == WebSocketMessageType.Text)
+                while (!result.EndOfMessage);
+
+                if (messageBuilder.Length > 0 && OnMessageReceived != null)
                 {
-                    var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    // Disparar evento en lugar de conn.OnMessageReceived
-                    if (OnMessageReceived != null)
-                        await OnMessageReceived.Invoke(conn.DeviceId, json);
+                    var fullMessage = messageBuilder.ToString();
+                    await OnMessageReceived.Invoke(conn.DeviceId, fullMessage);
                 }
             }
             catch (OperationCanceledException) { break; }

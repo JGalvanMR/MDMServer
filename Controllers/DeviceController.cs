@@ -57,11 +57,17 @@ public class DeviceController : ControllerBase
     /// <summary>Reporta el resultado de la ejecución de un comando.</summary>
     [HttpPost("command-result")]
     [ProducesResponseType(typeof(ApiResponse), 200)]
-    [ProducesResponseType(typeof(ApiResponse), 400)]
-    [ProducesResponseType(typeof(ApiResponse), 401)]
+    [RequestSizeLimit(10 * 1024 * 1024)] // Permitir hasta 10MB para screenshots
     public async Task<IActionResult> CommandResult([FromBody] CommandResultRequest request)
     {
         var (device, _) = await AuthorizeDeviceAsync();
+
+        // Log de tamaño para debugging
+        var payloadSize = request.ResultJson?.Length ?? 0;
+        _logger.LogInformation(
+            "Resultado recibido: CommandId={CommandId}, Size={Size}chars, Success={Success}",
+            request.CommandId, payloadSize, request.Success);
+
         await _commandService.ReportResultAsync(device.DeviceId, request);
         return Ok(ApiResponse.OkEmpty("Resultado registrado.", GetRequestId()));
     }
@@ -111,7 +117,7 @@ public class DeviceController : ControllerBase
                 (decimal)request.Latitude.Value,
                 (decimal)request.Longitude.Value,
                 request.LocationAccuracy);
-            
+
             // Si hay eventos triggered, podrías enviar notificaciones aquí
             if (geofenceResult.TriggeredEvents.Any())
             {

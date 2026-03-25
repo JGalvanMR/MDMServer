@@ -30,22 +30,31 @@ public class DeviceService : IDeviceService
     private readonly ICommandRepository _commandRepo;
     private readonly ITokenService _tokenService;
     private readonly ILogger<DeviceService> _logger;
-
-    // En DeviceService.cs — agregar en constructor
     private readonly IDbConnectionFactory _dbFactory;
+
+    // ── CORRECCIÓN: clase concreta para mapeo Dapper ──────────────────────────
+    // Dapper no puede mapear ValueTuple<T1,T2,T3> por nombre de columna.
+    // El QuerySingleAsync<(string, string, bool)> original lanzaba InvalidCastException
+    // en runtime porque Dapper intenta asignar Item1/Item2/Item3, no los nombres reales.
+    private sealed class UpsertDeviceResult
+    {
+        public string DeviceId  { get; set; } = string.Empty;
+        public string Token     { get; set; } = string.Empty;
+        public bool   IsNew     { get; set; }
+    }
 
     public DeviceService(
         IDeviceRepository deviceRepo,
         ICommandRepository commandRepo,
         ITokenService tokenService,
-        IDbConnectionFactory dbFactory,        // ← agregar
+        IDbConnectionFactory dbFactory,
         ILogger<DeviceService> logger)
     {
-        _deviceRepo = deviceRepo;
-        _commandRepo = commandRepo;
+        _deviceRepo   = deviceRepo;
+        _commandRepo  = commandRepo;
         _tokenService = tokenService;
-        _dbFactory = dbFactory;             // ← agregar
-        _logger = logger;
+        _dbFactory    = dbFactory;
+        _logger       = logger;
     }
 
     public async Task<(Device Device, bool IsNew)> AuthenticateOrThrowAsync(string token)
@@ -63,30 +72,32 @@ public class DeviceService : IDeviceService
     }
 
     public async Task<bool> ExistsAsync(string deviceId)
-{
-    return await _deviceRepo.ExistsAsync(deviceId);
-}
+    {
+        return await _deviceRepo.ExistsAsync(deviceId);
+    }
 
-    // Services/DeviceService.cs — RegisterAsync con SP atómico
     public async Task<RegisterDeviceResponse> RegisterAsync(
         RegisterDeviceRequest request, string clientIp)
     {
         using var conn = await _dbFactory.CreateConnectionAsync();
 
-        var result = await conn.QuerySingleAsync<(string DeviceId, string Token, bool IsNew)>(@"
-        EXEC dbo.sp_UpsertDevice
-            @DeviceId, @DeviceName, @Model, @Manufacturer,
-            @AndroidVersion, @ApiLevel, @Token, @IpAddress",
+        // ── CORRECCIÓN: usar clase concreta UpsertDeviceResult en lugar de ValueTuple ──
+        // ValueTuple causaba crash silencioso: Dapper mapeaba por posición (Item1/Item2/Item3)
+        // y los valores llegaban como default(string)/default(bool).
+        var result = await conn.QuerySingleAsync<UpsertDeviceResult>(@"
+            EXEC dbo.sp_UpsertDevice
+                @DeviceId, @DeviceName, @Model, @Manufacturer,
+                @AndroidVersion, @ApiLevel, @Token, @IpAddress",
             new
             {
-                DeviceId = request.DeviceId,
-                DeviceName = request.DeviceName?.Trim(),
-                Model = request.Model?.Trim(),
+                DeviceId     = request.DeviceId,
+                DeviceName   = request.DeviceName?.Trim(),
+                Model        = request.Model?.Trim(),
                 Manufacturer = request.Manufacturer?.Trim(),
                 AndroidVersion = request.AndroidVersion,
-                ApiLevel = request.ApiLevel,
-                Token = _tokenService.GenerateDeviceToken(),
-                IpAddress = clientIp
+                ApiLevel     = request.ApiLevel,
+                Token        = _tokenService.GenerateDeviceToken(),
+                IpAddress    = clientIp
             }
         );
 
@@ -95,7 +106,8 @@ public class DeviceService : IDeviceService
             result.IsNew ? "Nuevo" : "Re-registro", request.DeviceId, clientIp);
 
         return new RegisterDeviceResponse(
-            result.DeviceId, result.Token,
+            result.DeviceId,
+            result.Token,
             result.IsNew ? "Dispositivo registrado correctamente." : "Token existente devuelto.",
             result.IsNew
         );
