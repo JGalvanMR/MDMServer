@@ -1,11 +1,3 @@
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.csproj.AssemblyReference.cache
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\rpswa.dswa.cache.json
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.GeneratedMSBuildEditorConfig.editorconfig
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.AssemblyInfoInputs.cache
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.AssemblyInfo.cs
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.csproj.CoreCompileInputs.cache
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.MvcApplicationPartsAssemblyInfo.cs
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.MvcApplicationPartsAssemblyInfo.cache
 C:\GitHub\MDMBase\MDMServer\bin\Debug\net8.0\appsettings.Development.json
 C:\GitHub\MDMBase\MDMServer\bin\Debug\net8.0\appsettings.json
 C:\GitHub\MDMBase\MDMServer\bin\Debug\net8.0\appsettings.Production.json
@@ -71,6 +63,15 @@ C:\GitHub\MDMBase\MDMServer\bin\Debug\net8.0\runtimes\win-arm64\native\Microsoft
 C:\GitHub\MDMBase\MDMServer\bin\Debug\net8.0\runtimes\win-x64\native\Microsoft.Data.SqlClient.SNI.dll
 C:\GitHub\MDMBase\MDMServer\bin\Debug\net8.0\runtimes\win-x86\native\Microsoft.Data.SqlClient.SNI.dll
 C:\GitHub\MDMBase\MDMServer\bin\Debug\net8.0\runtimes\win\lib\net8.0\System.Runtime.Caching.dll
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.csproj.AssemblyReference.cache
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\rpswa.dswa.cache.json
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.GeneratedMSBuildEditorConfig.editorconfig
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.AssemblyInfoInputs.cache
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.AssemblyInfo.cs
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.csproj.CoreCompileInputs.cache
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.MvcApplicationPartsAssemblyInfo.cs
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.MvcApplicationPartsAssemblyInfo.cache
+C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.sourcelink.json
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\rjimswa.dswa.cache.json
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\rjsmrazor.dswa.cache.json
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\rjsmcshtml.dswa.cache.json
@@ -86,4 +87,3 @@ C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\refint\MDMServer.dll
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.pdb
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.genruntimeconfig.cache
 C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\ref\MDMServer.dll
-C:\GitHub\MDMBase\MDMServer\obj\Debug\net8.0\MDMServer.sourcelink.json
