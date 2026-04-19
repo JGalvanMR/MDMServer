@@ -164,10 +164,32 @@ public class WebSocketHub : IWebSocketHub
 
     public async Task<bool> SendBinaryToViewer(string deviceId, byte[] data)
     {
-        var ws = _connMgr.GetViewerForDevice(deviceId);
-        if (ws == null || ws.State != WebSocketState.Open)
+        var viewers = _connMgr.GetViewersForDevice(deviceId);
+
+        if (viewers.Count == 0)
             return false;
-        await ws.SendAsync(data, WebSocketMessageType.Binary, true, CancellationToken.None);
+
+        var tasks = viewers.Select(async ws =>
+        {
+            try
+            {
+                if (ws.State == WebSocketState.Open)
+                {
+                    await ws.SendAsync(
+                        data,
+                        WebSocketMessageType.Binary,
+                        true,
+                        CancellationToken.None
+                    );
+                }
+            }
+            catch
+            {
+                // aquí puedes loggear si quieres
+            }
+        });
+
+        await Task.WhenAll(tasks);
         return true;
     }
 

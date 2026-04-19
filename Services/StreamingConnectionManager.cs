@@ -6,66 +6,76 @@ namespace MDMServer.Services;
 public class StreamingConnectionManager
 {
     private readonly ConcurrentDictionary<string, WebSocket> _viewers = new();
-    private readonly ConcurrentDictionary<string, string> _viewerToDevice = new();
-    private readonly ConcurrentDictionary<string, List<string>> _deviceToViewers = new();
 
-    public void AddViewer(string viewerId, WebSocket ws) => _viewers[viewerId] = ws;
-    
+    // viewerId -> deviceId
+    private readonly ConcurrentDictionary<string, string> _viewerToDevice = new();
+
+    // deviceId -> viewers (thread-safe)
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _deviceToViewers = new();
+
+    public void AddViewer(string viewerId, WebSocket ws)
+    {
+        _viewers[viewerId] = ws;
+    }
+
     public void MapViewerToDevice(string viewerId, string deviceId)
     {
         _viewerToDevice[viewerId] = deviceId;
-        _deviceToViewers.AddOrUpdate(deviceId, 
-            new List<string> { viewerId }, 
-            (k, v) => { v.Add(viewerId); return v; });
+
+        var viewers = _deviceToViewers.GetOrAdd(deviceId, _ => new ConcurrentDictionary<string, byte>());
+        viewers[viewerId] = 0;
     }
 
-    // Este método faltaba (singular):
-    public WebSocket? GetViewerForDevice(string deviceId)
-    {
-        if (_deviceToViewers.TryGetValue(deviceId, out var viewerIds) && viewerIds.Count > 0)
-        {
-            var firstViewerId = viewerIds.First();
-            return _viewers.TryGetValue(firstViewerId, out var ws) ? ws : null;
-        }
-        return null;
-    }
-
-    public string? GetDeviceForViewer(string viewerId) => 
-        _viewerToDevice.TryGetValue(viewerId, out var deviceId) ? deviceId : null;
-
+    // 🔥 PRODUCCIÓN: múltiples viewers
     public List<WebSocket> GetViewersForDevice(string deviceId)
     {
-        if (_deviceToViewers.TryGetValue(deviceId, out var viewerIds))
-        {
-            return viewerIds
-                .Select(id => _viewers.TryGetValue(id, out var ws) ? ws : null)
-                .Where(ws => ws != null && ws.State == WebSocketState.Open)
-                .ToList()!;
-        }
-        return new List<WebSocket>();
+        if (!_deviceToViewers.TryGetValue(deviceId, out var viewers))
+            return new List<WebSocket>();
+
+        return viewers.Keys
+            .Select(id => _viewers.TryGetValue(id, out var ws) ? ws : null)
+            .Where(ws => ws != null && ws.State == WebSocketState.Open)
+            .Cast<WebSocket>()
+            .ToList();
+    }
+
+    // 🔥 OPCIONAL: mantener compatibilidad
+    public WebSocket? GetFirstViewerForDevice(string deviceId)
+    {
+        return GetViewersForDevice(deviceId).FirstOrDefault();
+    }
+
+    public string? GetDeviceForViewer(string viewerId)
+    {
+        return _viewerToDevice.TryGetValue(viewerId, out var deviceId)
+            ? deviceId
+            : null;
     }
 
     public void RemoveViewer(string viewerId)
     {
         if (_viewerToDevice.TryRemove(viewerId, out var deviceId))
         {
-            if (_deviceToViewers.TryGetValue(deviceId, out var list))
+            if (_deviceToViewers.TryGetValue(deviceId, out var viewers))
             {
-                list.Remove(viewerId);
-                if (list.Count == 0) _deviceToViewers.TryRemove(deviceId, out _);
+                viewers.TryRemove(viewerId, out _);
+
+                if (viewers.IsEmpty)
+                    _deviceToViewers.TryRemove(deviceId, out _);
             }
         }
+
         _viewers.TryRemove(viewerId, out _);
     }
 
     public void RemoveViewerByDevice(string deviceId)
     {
-        if (_deviceToViewers.TryRemove(deviceId, out var viewerIds))
+        if (_deviceToViewers.TryRemove(deviceId, out var viewers))
         {
-            foreach (var vid in viewerIds)
+            foreach (var viewerId in viewers.Keys)
             {
-                _viewerToDevice.TryRemove(vid, out _);
-                _viewers.TryRemove(vid, out _);
+                _viewerToDevice.TryRemove(viewerId, out _);
+                _viewers.TryRemove(viewerId, out _);
             }
         }
     }

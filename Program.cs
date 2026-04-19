@@ -264,19 +264,19 @@ static async Task HandleViewerWebSocket(
     var ws = await ctx.WebSockets.AcceptWebSocketAsync();
     var viewerId = Guid.NewGuid().ToString();
     connMgr.AddViewer(viewerId, ws);
-    
+
     logger.LogInformation("Viewer {ViewerId} conectado desde {IP}", viewerId, ctx.Connection.RemoteIpAddress);
 
     var buffer = new byte[4096];
     bool isAuthenticated = false;
-    
+
     try
     {
         while (ws.State == WebSocketState.Open)
         {
             var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ctx.RequestAborted);
-            
-            if (result.MessageType == WebSocketMessageType.Close) 
+
+            if (result.MessageType == WebSocketMessageType.Close)
             {
                 logger.LogInformation("Viewer {ViewerId} cerró conexión", viewerId);
                 break;
@@ -286,9 +286,9 @@ static async Task HandleViewerWebSocket(
             {
                 var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
                 logger.LogDebug("Viewer {ViewerId} recibió: {Message}", viewerId, text);
-                
+
                 ViewerMessage? msg;
-                try 
+                try
                 {
                     msg = JsonSerializer.Deserialize<ViewerMessage>(text);
                 }
@@ -304,11 +304,11 @@ static async Task HandleViewerWebSocket(
                 {
                     var config = ctx.RequestServices.GetRequiredService<IConfiguration>();
                     var expectedKey = config["Mdm:AdminApiKey"];
-                    
-                    logger.LogDebug("Auth attempt. Key received: {Key}, Expected: {Expected}", 
-                        msg.AdminKey?.Substring(0, Math.Min(10, msg.AdminKey?.Length ?? 0)) + "...", 
+
+                    logger.LogDebug("Auth attempt. Key received: {Key}, Expected: {Expected}",
+                        msg.AdminKey?.Substring(0, Math.Min(10, msg.AdminKey?.Length ?? 0)) + "...",
                         expectedKey?.Substring(0, Math.Min(10, expectedKey?.Length ?? 0)) + "...");
-                    
+
                     if (msg.AdminKey != expectedKey)
                     {
                         logger.LogWarning("Viewer {ViewerId} auth fallido", viewerId);
@@ -316,7 +316,7 @@ static async Task HandleViewerWebSocket(
                             WebSocketMessageType.Text, true, CancellationToken.None);
                         break;
                     }
-                    
+
                     isAuthenticated = true;
                     logger.LogInformation("Viewer {ViewerId} autenticado exitosamente", viewerId);
                     await ws.SendAsync(Encoding.UTF8.GetBytes("{\"status\":\"authenticated\"}"),
@@ -333,18 +333,18 @@ static async Task HandleViewerWebSocket(
 
                     var deviceId = msg.DeviceId;
                     logger.LogInformation("Viewer {ViewerId} solicitó ver dispositivo {DeviceId}", viewerId, deviceId);
-                    
+
                     if (string.IsNullOrEmpty(deviceId) || !await deviceService.ExistsAsync(deviceId))
                     {
                         await ws.SendAsync(Encoding.UTF8.GetBytes("{\"error\":\"Device not found\"}"),
                             WebSocketMessageType.Text, true, CancellationToken.None);
                         continue;
                     }
-                    
+
                     connMgr.MapViewerToDevice(viewerId, deviceId);
                     await ws.SendAsync(Encoding.UTF8.GetBytes("{\"status\":\"watching\"}"),
                         WebSocketMessageType.Text, true, CancellationToken.None);
-                        
+
                     logger.LogInformation("Viewer {ViewerId} ahora observa dispositivo {DeviceId}", viewerId, deviceId);
                 }
                 else if (msg?.Type == "input")
@@ -353,7 +353,7 @@ static async Task HandleViewerWebSocket(
                     {
                         continue;
                     }
-                    
+
                     var targetDeviceId = connMgr.GetDeviceForViewer(viewerId);
                     if (targetDeviceId != null && deviceHub.IsOnline(targetDeviceId))
                     {
@@ -377,7 +377,23 @@ static async Task HandleViewerWebSocket(
     {
         connMgr.RemoveViewer(viewerId);
         logger.LogInformation("Viewer {ViewerId} desconectado y limpiado", viewerId);
-        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
+
+        try
+        {
+            if (ws.State == WebSocketState.Open ||
+                ws.State == WebSocketState.CloseReceived)
+            {
+                await ws.CloseAsync(
+                    WebSocketCloseStatus.NormalClosure,
+                    "Closed",
+                    CancellationToken.None
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug("Error cerrando WebSocket viewer: {Error}", ex.Message);
+        }
     }
 }
 
