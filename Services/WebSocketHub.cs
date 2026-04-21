@@ -18,10 +18,10 @@ public interface IWebSocketHub
     int OnlineCount { get; }
     IReadOnlyList<string> OnlineDeviceIds { get; }
     event Func<string, string, Task>? OnMessageReceived;
-    event Func<string, string, Task>? OnMessageText;      // rename (era OnMessageReceived)
-    event Func<string, byte[], Task>? OnMessageBinary;   // nuevo
-    Task<bool> SendTextAsync(string deviceId, string text);   // nuevo
-    Task<bool> SendBinaryToViewer(string deviceId, byte[] data); // nuevo
+    event Func<string, string, Task>? OnMessageText;
+    event Func<string, byte[], Task>? OnMessageBinary;
+    Task<bool> SendTextAsync(string deviceId, string text);
+    Task<bool> SendBinaryToViewer(string deviceId, byte[] data);
 }
 
 public class WebSocketHub : IWebSocketHub
@@ -29,27 +29,29 @@ public class WebSocketHub : IWebSocketHub
     public event Func<string, string, Task>? OnMessageText;
     public event Func<string, byte[], Task>? OnMessageBinary;
     public event Func<string, string, Task>? OnMessageReceived;
+
     private readonly ConcurrentDictionary<string, WebSocketConnection> _connections = new();
     private readonly ILogger<WebSocketHub> _logger;
     private readonly StreamingConnectionManager _connMgr;
+
     private readonly JsonSerializerOptions _jsonOpts = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
-    // Ping cada 30s para mantener la conexión viva
     private const int PingIntervalSeconds = 30;
 
-    // Aumentar a 512KB para manejar screenshots base64
-    private const int BufferSize = 524288; // 512KB
-    private const int MaxMessageSize = 5 * 1024 * 1024; // 5MB límite
+    // Tamaño del buffer por lectura individual (no limita el mensaje total)
+    private const int ReadBufferSize = 65536; // 64KB por chunk
+
+    // Límite máximo de un mensaje ensamblado
+    private const int MaxMessageSize = 5 * 1024 * 1024; // 5MB
 
     public WebSocketHub(ILogger<WebSocketHub> logger, StreamingConnectionManager connMgr)
     {
         _logger = logger;
         _connMgr = connMgr;
     }
-
 
     public int OnlineCount => _connections.Count(c => c.Value.IsAlive);
 
@@ -71,8 +73,6 @@ public class WebSocketHub : IWebSocketHub
         _logger.LogInformation("WS conectado: {DeviceId}", deviceId);
 
         using var pingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-
-        // Ping loop en background
         var pingTask = PingLoopAsync(conn, pingCts.Token);
 
         try
@@ -116,32 +116,84 @@ public class WebSocketHub : IWebSocketHub
         }
     }
 
+    /// <summary>
+    /// Loop principal de recepción con soporte correcto de fragmentación WebSocket.
+    ///
+    /// FIX: La versión anterior hacía un único ReceiveAsync y emitía el evento
+    /// inmediatamente. Los mensajes WebSocket (especialmente frames H264 grandes
+    /// o JSON con SPS/PPS) pueden llegar fragmentados en múltiples chunks.
+    /// Sin el loop do...while(!EndOfMessage) el payload llega truncado o
+    /// completamente ignorado en el caso de fragmentos intermedios.
+    /// </summary>
     private async Task ReceiveLoopAsync(WebSocketConnection conn, CancellationToken ct)
     {
-        var buffer = new byte[524288]; // 512KB
+        var buffer = new byte[ReadBufferSize];
+
         while (conn.IsAlive && !ct.IsCancellationRequested)
         {
             try
             {
-                var result = await conn.Ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
-                if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    await conn.Ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
-                    return;
-                }
+                // ── Ensamblar el mensaje completo antes de procesarlo ──────────
+                // Un mensaje WebSocket puede llegar en N frames (EndOfMessage=false
+                // en los N-1 primeros). Debemos acumular todos los chunks antes
+                // de emitir el evento para garantizar integridad del payload.
+                using var msgStream = new MemoryStream();
+                WebSocketReceiveResult result;
+                bool oversized = false;
+                WebSocketMessageType msgType = WebSocketMessageType.Text;
 
-                if (result.MessageType == WebSocketMessageType.Text)
+                do
                 {
-                    var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                    result = await conn.Ws.ReceiveAsync(new ArraySegment<byte>(buffer), ct);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        // Completar handshake de cierre si el socket aún lo permite
+                        if (conn.Ws.State == WebSocketState.Open ||
+                            conn.Ws.State == WebSocketState.CloseReceived)
+                        {
+                            await conn.Ws.CloseAsync(
+                                WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
+                        }
+                        return;
+                    }
+
+                    msgType = result.MessageType;
+
+                    if (!oversized)
+                    {
+                        msgStream.Write(buffer, 0, result.Count);
+
+                        if (msgStream.Length > MaxMessageSize)
+                        {
+                            oversized = true;
+                            _logger.LogError(
+                                "Mensaje WS de {DeviceId} excede {Max}MB — descartado",
+                                conn.DeviceId, MaxMessageSize / 1024 / 1024);
+                            // Seguimos leyendo hasta EndOfMessage para no desincronizar
+                            // el stream, pero descartamos el contenido.
+                        }
+                    }
+                }
+                while (!result.EndOfMessage);
+
+                // Mensaje descartado por tamaño excesivo
+                if (oversized) continue;
+
+                var payload = msgStream.ToArray();
+                if (payload.Length == 0) continue;
+
+                // ── Despachar por tipo ────────────────────────────────────────
+                if (msgType == WebSocketMessageType.Text)
+                {
+                    var text = Encoding.UTF8.GetString(payload);
                     if (OnMessageText != null)
                         await OnMessageText.Invoke(conn.DeviceId, text);
                 }
-                else if (result.MessageType == WebSocketMessageType.Binary)
+                else if (msgType == WebSocketMessageType.Binary)
                 {
-                    var data = new byte[result.Count];
-                    Array.Copy(buffer, data, result.Count);
                     if (OnMessageBinary != null)
-                        await OnMessageBinary.Invoke(conn.DeviceId, data);
+                        await OnMessageBinary.Invoke(conn.DeviceId, payload);
                 }
             }
             catch (OperationCanceledException) { break; }
@@ -157,6 +209,7 @@ public class WebSocketHub : IWebSocketHub
     {
         if (!_connections.TryGetValue(deviceId, out var conn) || !conn.IsAlive)
             return false;
+
         var bytes = Encoding.UTF8.GetBytes(text);
         await conn.SendAsync(bytes, WebSocketMessageType.Text, true);
         return true;
@@ -164,72 +217,24 @@ public class WebSocketHub : IWebSocketHub
 
     public async Task<bool> SendBinaryToViewer(string deviceId, byte[] data)
     {
-        var ws = _connMgr.GetViewerForDevice(deviceId);
-        if (ws == null || ws.State != WebSocketState.Open)
-            return false;
-        await ws.SendAsync(data, WebSocketMessageType.Binary, true, CancellationToken.None);
-        return true;
-    }
+        var viewers = _connMgr.GetViewersForDevice(deviceId);
+        if (viewers.Count == 0) return false;
 
-    private async Task ReceiveLoopAsyncOG(WebSocketConnection conn, CancellationToken ct)
-    {
-        var buffer = new byte[BufferSize];
-        var messageBuilder = new StringBuilder();
-
-        while (conn.IsAlive && !ct.IsCancellationRequested)
+        var tasks = viewers.Select(async ws =>
         {
             try
             {
-                WebSocketReceiveResult result;
-                messageBuilder.Clear();
-
-                do
-                {
-                    result = await conn.Ws.ReceiveAsync(
-                        new ArraySegment<byte>(buffer), ct);
-
-                    if (result.MessageType == WebSocketMessageType.Close)
-                    {
-                        await conn.Ws.CloseAsync(
-                            WebSocketCloseStatus.NormalClosure, "Cerrando", ct);
-                        return;
-                    }
-
-                    if (result.MessageType == WebSocketMessageType.Text)
-                    {
-                        var chunk = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        messageBuilder.Append(chunk);
-
-                        // Protección contra mensajes enormes
-                        if (messageBuilder.Length > MaxMessageSize)
-                        {
-                            _logger.LogError("Mensaje WS excede 5MB, descartando");
-                            messageBuilder.Clear();
-                            break;
-                        }
-                    }
-                    else if (result.MessageType == WebSocketMessageType.Binary)
-                    {
-                        var data = buffer.Take(result.Count).ToArray();
-                        if (OnMessageBinary != null)
-                            await OnMessageBinary.Invoke(conn.DeviceId, data);
-                    }
-                }
-                while (!result.EndOfMessage);
-
-                if (messageBuilder.Length > 0 && OnMessageReceived != null)
-                {
-                    var fullMessage = messageBuilder.ToString();
-                    await OnMessageReceived.Invoke(conn.DeviceId, fullMessage);
-                }
+                if (ws.State == WebSocketState.Open)
+                    await ws.SendAsync(data, WebSocketMessageType.Binary, true, CancellationToken.None);
             }
-            catch (OperationCanceledException) { break; }
-            catch (WebSocketException ex)
+            catch (Exception ex)
             {
-                _logger.LogDebug("WS error {DeviceId}: {Msg}", conn.DeviceId, ex.Message);
-                break;
+                _logger.LogDebug("SendBinaryToViewer error: {Error}", ex.Message);
             }
-        }
+        });
+
+        await Task.WhenAll(tasks);
+        return true;
     }
 
     private async Task PingLoopAsync(WebSocketConnection conn, CancellationToken ct)
@@ -257,7 +262,6 @@ public class WebSocketConnection
     public string DeviceId { get; }
     public DateTime ConnectedAt { get; } = DateTime.UtcNow;
 
-    // Suscriptores al evento de mensaje entrante
     public event Action<string>? MessageReceived;
 
     private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -268,8 +272,7 @@ public class WebSocketConnection
         DeviceId = deviceId;
     }
 
-    public bool IsAlive =>
-        Ws.State == WebSocketState.Open;
+    public bool IsAlive => Ws.State == WebSocketState.Open;
 
     public async Task SendAsync(byte[] data, WebSocketMessageType type, bool endOfMessage)
     {

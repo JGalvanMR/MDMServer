@@ -85,7 +85,12 @@ builder.Services.AddScoped<IGeofenceService, GeofenceService>();
 builder.Services.AddHostedService<CommandExpiryService>();
 builder.Services.AddScoped<ITelemetryRepository, TelemetryRepository>();
 builder.Services.AddSingleton<StreamingConnectionManager>();
-builder.Services.AddSingleton<IWebSocketHub, WebSocketHub>(); // <-- asegurar registro
+builder.Services.AddSingleton<IWebSocketHub, WebSocketHub>();
+
+builder.WebHost.ConfigureKestrel(options =>
+{
+    options.ListenLocalhost(61210);
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 var app = builder.Build();
@@ -145,10 +150,10 @@ using (var scope = app.Services.CreateScope())
     }
 }
 
-// ── Endpoint WebSocket para dispositivos (método estático) ────────────────────
+// ── Endpoint WebSocket para dispositivos ─────────────────────────────────────
 app.MapGet("/ws/device", HandleDeviceWebSocket);
 
-// ── Endpoint WebSocket para viewers (método estático) ─────────────────────────
+// ── Endpoint WebSocket para viewers ──────────────────────────────────────────
 app.MapGet("/ws/viewer", HandleViewerWebSocket);
 
 Log.Information("MDM Server listo en {Urls}", string.Join(", ", app.Urls));
@@ -156,7 +161,7 @@ await app.RunAsync();
 return 0;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// MÉTODOS ESTÁTICOS PARA WEBSOCKETS
+// WEBSOCKET: DISPOSITIVO
 // ──────────────────────────────────────────────────────────────────────────────
 
 static async Task HandleDeviceWebSocket(
@@ -164,9 +169,9 @@ static async Task HandleDeviceWebSocket(
     [FromServices] IDeviceService deviceService,
     [FromServices] ICommandService commandService,
     [FromServices] IWebSocketHub hub,
+    [FromServices] StreamingConnectionManager connMgr,
     [FromServices] ILogger<Program> logger)
 {
-    var connMgr = ctx.RequestServices.GetRequiredService<StreamingConnectionManager>();
     if (!ctx.WebSockets.IsWebSocketRequest)
     {
         ctx.Response.StatusCode = 400;
@@ -200,40 +205,115 @@ static async Task HandleDeviceWebSocket(
         PropertyNameCaseInsensitive = true
     };
 
-    // Función handler para mensajes de texto (evento OnMessageText)
+    // ── Contador para auto-stop cuando no hay viewers ────────────────────────
+    var framesWithoutViewers = 0;
+    const int MaxIdleFrames = 30; // ~1s a 30fps
+    var autoStopped = false;
+
+    // ── Handler de mensajes de texto ─────────────────────────────────────────
     Func<string, string, Task> messageHandler = async (deviceId, json) =>
     {
         if (deviceId != device.DeviceId) return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("type", out var typeEl))
+            {
+                var msgType = typeEl.GetString()?.ToUpperInvariant();
+
+                if (msgType is "RESULT" or "STATUS" or "PONG" or "HELLO")
+                {
+                    await ProcessWsMessageAsync(json, deviceId, commandService, deviceService, jsonOpts);
+                    return;
+                }
+
+                // ── Solo reenviar si hay viewers conectados ───────────────────
+                var viewers = connMgr.GetViewersForDevice(deviceId);
+                if (viewers.Count == 0) return;
+
+                if (msgType == "VIDEO_CONFIG")
+                {
+                    connMgr.SetVideoConfig(deviceId, json);
+                    logger.LogWarning(
+                        "🔥 VIDEO_CONFIG recibido de {DeviceId}: {Json}",
+                        deviceId, json);
+                }
+
+                var jsonBytes = Encoding.UTF8.GetBytes(json);
+                foreach (var viewer in viewers)
+                {
+                    if (viewer.State != WebSocketState.Open) continue;
+                    try
+                    {
+                        await viewer.SendAsync(
+                            jsonBytes, WebSocketMessageType.Text, true, CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogDebug("Error reenviando {MsgType} a viewer: {Error}", msgType, ex.Message);
+                    }
+                }
+                return;
+            }
+        }
+        catch { }
+
         await ProcessWsMessageAsync(json, deviceId, commandService, deviceService, jsonOpts);
     };
 
-    // Handler para mensajes binarios (VIDEO) - AGREGAR ESTO:
+    // ── Handler de mensajes binarios (frames H264) ────────────────────────────
     Func<string, byte[], Task> messageHandlerBinary = async (devId, data) =>
     {
         if (devId != device.DeviceId) return;
 
-        // Reenviar a todos los viewers conectados a este dispositivo
         var viewers = connMgr.GetViewersForDevice(devId);
+
+        // ── No hay viewers: contar frames idle y auto-stop ───────────────────
+        if (viewers.Count == 0)
+        {
+            framesWithoutViewers++;
+
+            if (!autoStopped && framesWithoutViewers >= MaxIdleFrames)
+            {
+                autoStopped = true;
+                logger.LogInformation(
+                    "Sin viewers para {DeviceId} tras {Frames} frames — enviando STOP_SCREEN_STREAM",
+                    devId, MaxIdleFrames);
+                try
+                {
+                    await hub.SendTextAsync(devId, "{\"type\":\"STOP_SCREEN_STREAM\"}");
+                }
+                catch (Exception ex)
+                {
+                    logger.LogDebug("Error enviando stop a dispositivo: {Error}", ex.Message);
+                }
+            }
+            return;
+        }
+
+        // ── Hay viewers: resetear contador y reenviar ────────────────────────
+        framesWithoutViewers = 0;
+        autoStopped = false;
+
         foreach (var viewer in viewers)
         {
+            if (viewer.State != WebSocketState.Open) continue;
             try
             {
-                if (viewer.State == WebSocketState.Open)
-                {
-                    await viewer.SendAsync(data, WebSocketMessageType.Binary, true, ctx.RequestAborted);
-                }
+                await viewer.SendAsync(
+                    data, WebSocketMessageType.Binary, true, CancellationToken.None);
             }
             catch (Exception ex)
             {
-                logger.LogDebug("Error enviando video a viewer: {Error}", ex.Message);
+                logger.LogDebug("Error enviando frame binario a viewer: {Error}", ex.Message);
             }
         }
     };
 
-    // Suscribirse al evento OnMessageText
     hub.OnMessageText += messageHandler;
-    // Suscribirse al evento OnMessageBinary
     hub.OnMessageBinary += messageHandlerBinary;
+
     try
     {
         await hub.HandleConnectionAsync(device.DeviceId, ws, ctx.RequestAborted);
@@ -242,19 +322,41 @@ static async Task HandleDeviceWebSocket(
     {
         hub.OnMessageText -= messageHandler;
         hub.OnMessageBinary -= messageHandlerBinary;
+
+        connMgr.ClearVideoConfig(device.DeviceId);
+
         logger.LogDebug(
             "Handler WS desuscrito para {DeviceId}. Conexiones activas: {Count}",
             device.DeviceId, hub.OnlineCount);
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// WEBSOCKET: VIEWER
+// ──────────────────────────────────────────────────────────────────────────────
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIX #1 — JsonSerializerOptions compartido, case-insensitive
+// ══════════════════════════════════════════════════════════════════════════════
+// System.Text.Json es CASE-SENSITIVE por defecto.
+// El cliente envía {"type":"auth","adminKey":"..."} (camelCase)
+// pero las propiedades C# son "Type" y "AdminKey" (PascalCase).
+// Sin PropertyNameCaseInsensitive = true, deserializa Type="" y AdminKey=null.
+// Ningún if/else coincide → mensaje silenciosamente descartado.
+// ══════════════════════════════════════════════════════════════════════════════
+
 static async Task HandleViewerWebSocket(
     HttpContext ctx,
     [FromServices] IDeviceService deviceService,
     [FromServices] IWebSocketHub deviceHub,
     [FromServices] StreamingConnectionManager connMgr,
-    [FromServices] ILogger<Program> logger)  // Agregar logger
+    [FromServices] ILogger<Program> logger)
 {
+    // ✅ Local variable — works in top-level statements
+    var viewerJsonOpts = new JsonSerializerOptions
+    {
+        PropertyNameCaseInsensitive = true
+    };
     if (!ctx.WebSockets.IsWebSocketRequest)
     {
         ctx.Response.StatusCode = 400;
@@ -264,112 +366,202 @@ static async Task HandleViewerWebSocket(
     var ws = await ctx.WebSockets.AcceptWebSocketAsync();
     var viewerId = Guid.NewGuid().ToString();
     connMgr.AddViewer(viewerId, ws);
-    
-    logger.LogInformation("Viewer {ViewerId} conectado desde {IP}", viewerId, ctx.Connection.RemoteIpAddress);
 
-    var buffer = new byte[4096];
+    logger.LogInformation("Viewer {ViewerId} conectado desde {IP}",
+        viewerId, ctx.Connection.RemoteIpAddress);
+
+    var buffer = new byte[8192];
+    var recvStream = new MemoryStream();
     bool isAuthenticated = false;
-    
+    string? watchingDeviceId = null;
+
     try
     {
         while (ws.State == WebSocketState.Open)
         {
-            var result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ctx.RequestAborted);
-            
-            if (result.MessageType == WebSocketMessageType.Close) 
+            WebSocketReceiveResult result;
+
+            // ══════════════════════════════════════════════════════════════════
+            // FIX #2 — Leer mensaje completo (manejar fragmentación)
+            // ══════════════════════════════════════════════════════════════════
+            // La versión anterior hacía un solo ReceiveAsync y asumía que
+            // result.Count era el mensaje completo. Si el mensaje se fragmenta
+            // en varios frames TCP (EndOfMessage=false), solo leía el primer
+            // fragmento y el JSON quedaba truncado → deserialización fallaba.
+            // ══════════════════════════════════════════════════════════════════
+            do
             {
-                logger.LogInformation("Viewer {ViewerId} cerró conexión", viewerId);
+                result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ctx.RequestAborted);
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    logger.LogInformation("Viewer {ViewerId} cerró conexión", viewerId);
+                    break;
+                }
+
+                recvStream.Write(buffer, 0, result.Count);
+            } while (!result.EndOfMessage);
+
+            if (result.MessageType == WebSocketMessageType.Close)
                 break;
+
+            if (result.MessageType != WebSocketMessageType.Text)
+            {
+                recvStream.SetLength(0);
+                continue;
             }
 
-            if (result.MessageType == WebSocketMessageType.Text)
+            var text = Encoding.UTF8.GetString(recvStream.ToArray());
+            recvStream.SetLength(0);
+
+            logger.LogDebug("Viewer {ViewerId} recibió: {Message}", viewerId, text);
+
+            ViewerMessage? msg;
+            try
             {
-                var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                logger.LogDebug("Viewer {ViewerId} recibió: {Message}", viewerId, text);
-                
-                ViewerMessage? msg;
-                try 
+                // ══════════════════════════════════════════════════════════════
+                // FIX #1 (aplicado) — PropertyNameCaseInsensitive = true
+                // ══════════════════════════════════════════════════════════════
+                msg = JsonSerializer.Deserialize<ViewerMessage>(text, viewerJsonOpts);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning("Error deserializando mensaje de viewer: {Error}", ex.Message);
+                await SendViewerTextAsync(ws, "{\"error\":\"Invalid JSON\"}");
+                continue;
+            }
+
+            if (msg?.Type == "auth")
+            {
+                var config = ctx.RequestServices.GetRequiredService<IConfiguration>();
+                var expectedKey = config["Mdm:AdminApiKey"];
+
+                logger.LogDebug(
+                    "Auth attempt. Key received: {Key}, Expected: {Expected}",
+                    msg.AdminKey?.Substring(0, Math.Min(10, msg.AdminKey?.Length ?? 0)) + "...",
+                    expectedKey?.Substring(0, Math.Min(10, expectedKey?.Length ?? 0)) + "...");
+
+                if (msg.AdminKey != expectedKey)
                 {
-                    msg = JsonSerializer.Deserialize<ViewerMessage>(text);
+                    logger.LogWarning("Viewer {ViewerId} auth fallido — key mismatch", viewerId);
+                    await SendViewerTextAsync(ws, "{\"error\":\"Invalid admin key\"}");
+                    break;
                 }
-                catch (Exception ex)
+
+                isAuthenticated = true;
+                logger.LogInformation("Viewer {ViewerId} autenticado exitosamente", viewerId);
+                await SendViewerTextAsync(ws, "{\"status\":\"authenticated\"}");
+            }
+            else if (msg?.Type == "watch")
+            {
+                if (!isAuthenticated)
                 {
-                    logger.LogWarning("Error deserializando mensaje de viewer: {Error}", ex.Message);
-                    await ws.SendAsync(Encoding.UTF8.GetBytes("{\"error\":\"Invalid JSON\"}"),
-                        WebSocketMessageType.Text, true, CancellationToken.None);
+                    await SendViewerTextAsync(ws, "{\"error\":\"Not authenticated\"}");
                     continue;
                 }
 
-                if (msg?.Type == "auth")
-                {
-                    var config = ctx.RequestServices.GetRequiredService<IConfiguration>();
-                    var expectedKey = config["Mdm:AdminApiKey"];
-                    
-                    logger.LogDebug("Auth attempt. Key received: {Key}, Expected: {Expected}", 
-                        msg.AdminKey?.Substring(0, Math.Min(10, msg.AdminKey?.Length ?? 0)) + "...", 
-                        expectedKey?.Substring(0, Math.Min(10, expectedKey?.Length ?? 0)) + "...");
-                    
-                    if (msg.AdminKey != expectedKey)
-                    {
-                        logger.LogWarning("Viewer {ViewerId} auth fallido", viewerId);
-                        await ws.SendAsync(Encoding.UTF8.GetBytes("{\"error\":\"Invalid admin key\"}"),
-                            WebSocketMessageType.Text, true, CancellationToken.None);
-                        break;
-                    }
-                    
-                    isAuthenticated = true;
-                    logger.LogInformation("Viewer {ViewerId} autenticado exitosamente", viewerId);
-                    await ws.SendAsync(Encoding.UTF8.GetBytes("{\"status\":\"authenticated\"}"),
-                        WebSocketMessageType.Text, true, CancellationToken.None);
-                }
-                else if (msg?.Type == "watch")
-                {
-                    if (!isAuthenticated)
-                    {
-                        await ws.SendAsync(Encoding.UTF8.GetBytes("{\"error\":\"Not authenticated\"}"),
-                            WebSocketMessageType.Text, true, CancellationToken.None);
-                        continue;
-                    }
+                var deviceId = msg.DeviceId;
+                logger.LogInformation(
+                    "Viewer {ViewerId} solicitó ver dispositivo {DeviceId}", viewerId, deviceId);
 
-                    var deviceId = msg.DeviceId;
-                    logger.LogInformation("Viewer {ViewerId} solicitó ver dispositivo {DeviceId}", viewerId, deviceId);
-                    
-                    if (string.IsNullOrEmpty(deviceId) || !await deviceService.ExistsAsync(deviceId))
-                    {
-                        await ws.SendAsync(Encoding.UTF8.GetBytes("{\"error\":\"Device not found\"}"),
-                            WebSocketMessageType.Text, true, CancellationToken.None);
-                        continue;
-                    }
-                    
-                    connMgr.MapViewerToDevice(viewerId, deviceId);
-                    await ws.SendAsync(Encoding.UTF8.GetBytes("{\"status\":\"watching\"}"),
-                        WebSocketMessageType.Text, true, CancellationToken.None);
-                        
-                    logger.LogInformation("Viewer {ViewerId} ahora observa dispositivo {DeviceId}", viewerId, deviceId);
-                }
-                else if (msg?.Type == "input")
+                if (string.IsNullOrEmpty(deviceId) || !await deviceService.ExistsAsync(deviceId))
                 {
-                    if (!isAuthenticated)
-                    {
-                        continue;
-                    }
-                    
-                    var targetDeviceId = connMgr.GetDeviceForViewer(viewerId);
-                    if (targetDeviceId != null && deviceHub.IsOnline(targetDeviceId))
-                    {
-                        var inputMsg = JsonSerializer.Serialize(new
-                        {
-                            type = "INPUT",
-                            eventType = msg.EventType,
-                            x = msg.X,
-                            y = msg.Y,
-                            keyCode = msg.KeyCode
-                        });
+                    await SendViewerTextAsync(ws, "{\"error\":\"Device not found\"}");
+                    continue;
+                }
 
-                        await deviceHub.SendTextAsync(targetDeviceId, inputMsg);
-                        logger.LogDebug("Input reenviado a dispositivo {DeviceId}: {Input}", targetDeviceId, inputMsg);
+                connMgr.MapViewerToDevice(viewerId, deviceId);
+                watchingDeviceId = deviceId;
+
+                // ── Late-join: enviar watching PRIMERO, luego video_config ───
+                // El cliente usa msg.status==="watching" para habilitar el UI
+                // de streaming. Enviar video_config antes de watching causaría
+                // que el cliente lo descarte porque configReadyRef es false.
+                await SendViewerTextAsync(ws, "{\"status\":\"watching\"}");
+
+                var cachedConfig = connMgr.GetVideoConfig(deviceId);
+                if (cachedConfig != null)
+                {
+                    try
+                    {
+                        await SendViewerTextAsync(ws, cachedConfig);
+                        logger.LogInformation(
+                            "video_config cacheado enviado a viewer {ViewerId} (late-join)", viewerId);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogDebug(
+                            "Error enviando video_config cacheado a viewer {ViewerId}: {Error}",
+                            viewerId, ex.Message);
                     }
                 }
+
+                logger.LogInformation(
+                    "Viewer {ViewerId} ahora observa dispositivo {DeviceId}", viewerId, deviceId);
+            }
+            // ══════════════════════════════════════════════════════════════════
+            // FIX #3 — Handler para request_keyframe
+            // ══════════════════════════════════════════════════════════════════
+            // El cliente envía {type:"request_keyframe"} cuando el watchdog
+            // detecta que no llegan frames. Sin este handler, el mensaje se
+            // descartaba y el keyframe nunca se solicitaba al dispositivo.
+            // ══════════════════════════════════════════════════════════════════
+            else if (msg?.Type == "request_keyframe")
+            {
+                if (!isAuthenticated || watchingDeviceId == null) continue;
+
+                logger.LogInformation(
+                    "Viewer {ViewerId} solicitó keyframe para dispositivo {DeviceId}",
+                    viewerId, watchingDeviceId);
+
+                if (deviceHub.IsOnline(watchingDeviceId))
+                {
+                    try
+                    {
+                        await deviceHub.SendTextAsync(watchingDeviceId,
+                            "{\"type\":\"REQUEST_KEYFRAME\"}");
+                        logger.LogInformation(
+                            "Request_keyframe reenviado a dispositivo {DeviceId}", watchingDeviceId);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(
+                            "Error enviando request_keyframe a dispositivo {DeviceId}: {Error}",
+                            watchingDeviceId, ex.Message);
+                    }
+                }
+                else
+                {
+                    logger.LogWarning(
+                        "No se puede solicitar keyframe: dispositivo {DeviceId} no está conectado via WS",
+                        watchingDeviceId);
+                }
+            }
+            else if (msg?.Type == "input")
+            {
+                if (!isAuthenticated) continue;
+
+                var targetDeviceId = connMgr.GetDeviceForViewer(viewerId);
+                if (targetDeviceId != null && deviceHub.IsOnline(targetDeviceId))
+                {
+                    var inputMsg = JsonSerializer.Serialize(new
+                    {
+                        type = "INPUT",
+                        eventType = msg.EventType,
+                        x = msg.X,
+                        y = msg.Y,
+                        keyCode = msg.KeyCode
+                    });
+
+                    await deviceHub.SendTextAsync(targetDeviceId, inputMsg);
+                    logger.LogDebug(
+                        "Input reenviado a dispositivo {DeviceId}: {Input}", targetDeviceId, inputMsg);
+                }
+            }
+            else
+            {
+                logger.LogWarning(
+                    "Viewer {ViewerId} mensaje tipo desconocido: {Type}", viewerId, msg?.Type ?? "(null)");
             }
         }
     }
@@ -377,9 +569,38 @@ static async Task HandleViewerWebSocket(
     {
         connMgr.RemoveViewer(viewerId);
         logger.LogInformation("Viewer {ViewerId} desconectado y limpiado", viewerId);
-        await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
+        recvStream.Dispose();
+
+        try
+        {
+            if (ws.State == WebSocketState.Open ||
+                ws.State == WebSocketState.CloseReceived)
+            {
+                await ws.CloseAsync(
+                    WebSocketCloseStatus.NormalClosure,
+                    "Closed",
+                    CancellationToken.None);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug("Error cerrando WebSocket viewer: {Error}", ex.Message);
+        }
     }
 }
+
+/// <summary>
+/// Helper para enviar texto a viewer sin repetir Encoding.UTF8.GetBytes
+/// </summary>
+static async Task SendViewerTextAsync(WebSocket ws, string text)
+{
+    var bytes = Encoding.UTF8.GetBytes(text);
+    await ws.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PROCESADOR DE MENSAJES DE DISPOSITIVO (gestión, no streaming)
+// ──────────────────────────────────────────────────────────────────────────────
 
 static async Task ProcessWsMessageAsync(
     string json,
@@ -416,8 +637,13 @@ static async Task ProcessWsMessageAsync(
                         battery, storage, kiosk ?? false, camOff ?? false, ip), ip);
                 break;
 
-            // PONG y otros tipos conocidos: ignorar silenciosamente
             case "PONG":
+                break;
+
+            case "REQUEST_KEYFRAME":
+                // El dispositivo debe manejar este mensaje en su ScreenStreamHandler
+                Serilog.Log.Information(
+                    "Request_keyframe reenviado a dispositivo {DeviceId}", deviceId);
                 break;
 
             default:
@@ -433,13 +659,13 @@ static async Task ProcessWsMessageAsync(
     }
 }
 
-// Agregar al final del archivo, fuera de los métodos estáticos:
+// ── ViewerMessage (modelo del protocolo viewer → servidor) ────────────────────
 public class ViewerMessage
 {
     public string Type { get; set; } = "";
     public string? AdminKey { get; set; }
     public string? DeviceId { get; set; }
-    public string? EventType { get; set; } // "touch_down", "touch_up", "key", etc.
+    public string? EventType { get; set; }
     public int? X { get; set; }
     public int? Y { get; set; }
     public int? KeyCode { get; set; }
