@@ -266,7 +266,6 @@ static async Task HandleDeviceWebSocket(
     Func<string, byte[], Task> messageHandlerBinary = async (devId, data) =>
     {
         if (devId != device.DeviceId) return;
-
         var viewers = connMgr.GetViewersForDevice(devId);
 
         // ── No hay viewers: contar frames idle y auto-stop ───────────────────
