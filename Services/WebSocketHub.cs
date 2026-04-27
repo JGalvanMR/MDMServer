@@ -34,6 +34,9 @@ public class WebSocketHub : IWebSocketHub
     private readonly ILogger<WebSocketHub> _logger;
     private readonly StreamingConnectionManager _connMgr;
 
+    private readonly ConcurrentDictionary<string, DateTime> _lastConnectTime = new();
+    private static readonly TimeSpan ReconnectCooldown = TimeSpan.FromSeconds(2);
+
     private readonly JsonSerializerOptions _jsonOpts = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
@@ -68,6 +71,49 @@ public class WebSocketHub : IWebSocketHub
     public async Task HandleConnectionAsync(
         string deviceId, WebSocket ws, CancellationToken ct)
     {
+        var now = DateTime.UtcNow;
+
+        // ★ FIX ANTI-STORM: Rechazar conexiones demasiado rápidas del mismo dispositivo
+        if (_lastConnectTime.TryGetValue(deviceId, out var lastTime) && (now - lastTime) < ReconnectCooldown)
+        {
+            _logger.LogWarning("WS Storm bloqueado para {DeviceId}. Reconexión muy rápida.", deviceId);
+            try
+            {
+                await ws.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Reconnect too fast", CancellationToken.None);
+            }
+            catch { /* ignorar */ }
+            return;
+        }
+
+        // Registrar el tiempo de esta nueva conexión válida
+        _lastConnectTime[deviceId] = now;
+
+        // ═══════════════════════════════════════════════════════════════════════
+        // ★ FIX RAÍZ: Cerrar conexión anterior si existe
+        // ═══════════════════════════════════════════════════════════════════════
+        // Sin esto, cuando el Android reconecta rápido, la conexión vieja sigue
+        // viva en su propio ReceiveLoopAsync. Sigue consumiendo mensajes del
+        // dispositivo y disparando OnMessageText. Peor aún, cuando la vieja
+        // finalmente muere, su bloque 'finally' ejecuta TryRemove y ELIMINA
+        // la conexión nueva del diccionario, dejando el sistema en estado roto.
+        // ═══════════════════════════════════════════════════════════════════════
+        if (_connections.TryGetValue(deviceId, out var oldConn))
+        {
+            try
+            {
+                if (oldConn.IsAlive)
+                {
+                    _logger.LogInformation(
+                        "WS cerrando conexión previa de {DeviceId} (anti-zombi)", deviceId);
+                    await oldConn.Ws.CloseAsync(
+                        WebSocketCloseStatus.PolicyViolation,
+                        "Replaced by new connection",
+                        CancellationToken.None);
+                }
+            }
+            catch { /* ignorar error al matar zombi */ }
+        }
+
         var conn = new WebSocketConnection(ws, deviceId);
         _connections[deviceId] = conn;
         _logger.LogInformation("WS conectado: {DeviceId}", deviceId);
@@ -84,7 +130,19 @@ public class WebSocketHub : IWebSocketHub
             pingCts.Cancel();
             try { await pingTask; } catch { /* ignore */ }
 
-            _connections.TryRemove(deviceId, out _);
+            // ═══════════════════════════════════════════════════════════════════════
+            // ★ FIX RAÍZ: Solo eliminar si SOMOS la conexión activa
+            // ═══════════════════════════════════════════════════════════════════════
+            // Si fuimos reemplazados por una conexión nueva, NO debemos eliminar
+            // al recién llegado del diccionario. ReferenceEquals verifica que
+            // el objeto en el diccionario es exactamente este objeto en memoria.
+            // ═══════════════════════════════════════════════════════════════════════
+            if (_connections.TryGetValue(deviceId, out var currentConn)
+                && ReferenceEquals(currentConn, conn))
+            {
+                _connections.TryRemove(deviceId, out _);
+            }
+
             _logger.LogInformation("WS desconectado: {DeviceId}", deviceId);
         }
     }

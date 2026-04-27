@@ -1,19 +1,22 @@
 using FluentValidation;
 using FluentValidation.AspNetCore;
-using Serilog;
 using MDMServer.Data;
 using MDMServer.Filters;
 using MDMServer.Middleware;
+using MDMServer.Models;
 using MDMServer.Repositories;
 using MDMServer.Repositories.Interfaces;
 using MDMServer.Services;
 using MDMServer.Services.Interfaces;
 using MDMServer.Validators;
-using System.Net.WebSockets;
-using System.Text.Json;
-using System.Text;
-using MDMServer.Models;
 using Microsoft.AspNetCore.Mvc;
+using Serilog;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Channels;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -161,7 +164,7 @@ await app.RunAsync();
 return 0;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// WEBSOCKET: DISPOSITIVO
+// FUNCIONES LOCALES ESTÁTICAS
 // ──────────────────────────────────────────────────────────────────────────────
 
 static async Task HandleDeviceWebSocket(
@@ -205,12 +208,55 @@ static async Task HandleDeviceWebSocket(
         PropertyNameCaseInsensitive = true
     };
 
-    // ── Contador para auto-stop cuando no hay viewers ────────────────────────
+    var frameChannel = Channel.CreateBounded<PooledFrame>(new BoundedChannelOptions(60)
+    {
+        FullMode = BoundedChannelFullMode.DropOldest,
+        SingleReader = true
+    });
+
     var framesWithoutViewers = 0;
-    const int MaxIdleFrames = 30; // ~1s a 30fps
+    const int MaxIdleFrames = 30;
     var autoStopped = false;
 
-    // ── Handler de mensajes de texto ─────────────────────────────────────────
+    using var deviceCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+    var lastConfigTime = DateTime.MinValue;
+
+    var forwarderTask = Task.Run(async () =>
+    {
+        try
+        {
+            await foreach (var frame in frameChannel.Reader.ReadAllAsync(deviceCts.Token))
+            {
+                var viewers = connMgr.GetViewersForDevice(device.DeviceId);
+                if (viewers.Count == 0) continue;
+
+                foreach (var viewer in viewers)
+                {
+                    if (viewer.State != WebSocketState.Open) continue;
+                    try
+                    {
+                        await viewer.SendAsync(
+                            frame.Buffer.AsMemory(0, frame.Length),
+                            WebSocketMessageType.Binary,
+                            true,
+                            CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogDebug("Error enviando frame binario a viewer: {Error}", ex.Message);
+                    }
+                }
+
+                ArrayPool<byte>.Shared.Return(frame.Buffer);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error crítico en el forwarder de frames para {DeviceId}", device.DeviceId);
+        }
+    }, deviceCts.Token);
+
     Func<string, string, Task> messageHandler = async (deviceId, json) =>
     {
         if (deviceId != device.DeviceId) return;
@@ -228,16 +274,25 @@ static async Task HandleDeviceWebSocket(
                     return;
                 }
 
-                // ── Solo reenviar si hay viewers conectados ───────────────────
                 var viewers = connMgr.GetViewersForDevice(deviceId);
                 if (viewers.Count == 0) return;
 
+                // ══════════════════════════════════════════════════════════════
+                // ★ FIX RATE-LIMIT: No reenviar video_config si llegó hace < 500ms
+                // ══════════════════════════════════════════════════════════════
                 if (msgType == "VIDEO_CONFIG")
                 {
                     connMgr.SetVideoConfig(deviceId, json);
-                    logger.LogWarning(
-                        "🔥 VIDEO_CONFIG recibido de {DeviceId}: {Json}",
-                        deviceId, json);
+
+                    var now = DateTime.UtcNow;
+                    if ((now - lastConfigTime).TotalMilliseconds < 500)
+                    {
+                        logger.LogDebug("VIDEO_CONFIG descartado (rate-limit) para {DeviceId}", deviceId);
+                        return;
+                    }
+                    lastConfigTime = now;
+
+                    logger.LogWarning("🔥 VIDEO_CONFIG recibido y reenviado de {DeviceId}", deviceId);
                 }
 
                 var jsonBytes = Encoding.UTF8.GetBytes(json);
@@ -246,12 +301,11 @@ static async Task HandleDeviceWebSocket(
                     if (viewer.State != WebSocketState.Open) continue;
                     try
                     {
-                        await viewer.SendAsync(
-                            jsonBytes, WebSocketMessageType.Text, true, CancellationToken.None);
+                        await viewer.SendAsync(jsonBytes, WebSocketMessageType.Text, true, CancellationToken.None);
                     }
                     catch (Exception ex)
                     {
-                        logger.LogDebug("Error reenviando {MsgType} a viewer: {Error}", msgType, ex.Message);
+                        logger.LogDebug("Error reenviando texto a viewer: {Error}", ex.Message);
                     }
                 }
                 return;
@@ -262,13 +316,12 @@ static async Task HandleDeviceWebSocket(
         await ProcessWsMessageAsync(json, deviceId, commandService, deviceService, jsonOpts);
     };
 
-    // ── Handler de mensajes binarios (frames H264) ────────────────────────────
     Func<string, byte[], Task> messageHandlerBinary = async (devId, data) =>
     {
         if (devId != device.DeviceId) return;
+
         var viewers = connMgr.GetViewersForDevice(devId);
 
-        // ── No hay viewers: contar frames idle y auto-stop ───────────────────
         if (viewers.Count == 0)
         {
             framesWithoutViewers++;
@@ -291,22 +344,15 @@ static async Task HandleDeviceWebSocket(
             return;
         }
 
-        // ── Hay viewers: resetear contador y reenviar ────────────────────────
         framesWithoutViewers = 0;
         autoStopped = false;
 
-        foreach (var viewer in viewers)
+        var pooledBuffer = ArrayPool<byte>.Shared.Rent(data.Length);
+        Buffer.BlockCopy(data, 0, pooledBuffer, 0, data.Length);
+
+        if (!frameChannel.Writer.TryWrite(new PooledFrame { Buffer = pooledBuffer, Length = data.Length }))
         {
-            if (viewer.State != WebSocketState.Open) continue;
-            try
-            {
-                await viewer.SendAsync(
-                    data, WebSocketMessageType.Binary, true, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                logger.LogDebug("Error enviando frame binario a viewer: {Error}", ex.Message);
-            }
+            ArrayPool<byte>.Shared.Return(pooledBuffer);
         }
     };
 
@@ -322,6 +368,16 @@ static async Task HandleDeviceWebSocket(
         hub.OnMessageText -= messageHandler;
         hub.OnMessageBinary -= messageHandlerBinary;
 
+        frameChannel.Writer.Complete();
+        deviceCts.Cancel();
+
+        try { await forwarderTask; } catch { }
+
+        while (frameChannel.Reader.TryRead(out var remainingFrame))
+        {
+            ArrayPool<byte>.Shared.Return(remainingFrame.Buffer);
+        }
+
         connMgr.ClearVideoConfig(device.DeviceId);
 
         logger.LogDebug(
@@ -330,20 +386,6 @@ static async Task HandleDeviceWebSocket(
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// WEBSOCKET: VIEWER
-// ──────────────────────────────────────────────────────────────────────────────
-
-// ══════════════════════════════════════════════════════════════════════════════
-// FIX #1 — JsonSerializerOptions compartido, case-insensitive
-// ══════════════════════════════════════════════════════════════════════════════
-// System.Text.Json es CASE-SENSITIVE por defecto.
-// El cliente envía {"type":"auth","adminKey":"..."} (camelCase)
-// pero las propiedades C# son "Type" y "AdminKey" (PascalCase).
-// Sin PropertyNameCaseInsensitive = true, deserializa Type="" y AdminKey=null.
-// Ningún if/else coincide → mensaje silenciosamente descartado.
-// ══════════════════════════════════════════════════════════════════════════════
-
 static async Task HandleViewerWebSocket(
     HttpContext ctx,
     [FromServices] IDeviceService deviceService,
@@ -351,11 +393,11 @@ static async Task HandleViewerWebSocket(
     [FromServices] StreamingConnectionManager connMgr,
     [FromServices] ILogger<Program> logger)
 {
-    // ✅ Local variable — works in top-level statements
     var viewerJsonOpts = new JsonSerializerOptions
     {
         PropertyNameCaseInsensitive = true
     };
+
     if (!ctx.WebSockets.IsWebSocketRequest)
     {
         ctx.Response.StatusCode = 400;
@@ -380,14 +422,6 @@ static async Task HandleViewerWebSocket(
         {
             WebSocketReceiveResult result;
 
-            // ══════════════════════════════════════════════════════════════════
-            // FIX #2 — Leer mensaje completo (manejar fragmentación)
-            // ══════════════════════════════════════════════════════════════════
-            // La versión anterior hacía un solo ReceiveAsync y asumía que
-            // result.Count era el mensaje completo. Si el mensaje se fragmenta
-            // en varios frames TCP (EndOfMessage=false), solo leía el primer
-            // fragmento y el JSON quedaba truncado → deserialización fallaba.
-            // ══════════════════════════════════════════════════════════════════
             do
             {
                 result = await ws.ReceiveAsync(new ArraySegment<byte>(buffer), ctx.RequestAborted);
@@ -418,9 +452,6 @@ static async Task HandleViewerWebSocket(
             ViewerMessage? msg;
             try
             {
-                // ══════════════════════════════════════════════════════════════
-                // FIX #1 (aplicado) — PropertyNameCaseInsensitive = true
-                // ══════════════════════════════════════════════════════════════
                 msg = JsonSerializer.Deserialize<ViewerMessage>(text, viewerJsonOpts);
             }
             catch (Exception ex)
@@ -472,10 +503,6 @@ static async Task HandleViewerWebSocket(
                 connMgr.MapViewerToDevice(viewerId, deviceId);
                 watchingDeviceId = deviceId;
 
-                // ── Late-join: enviar watching PRIMERO, luego video_config ───
-                // El cliente usa msg.status==="watching" para habilitar el UI
-                // de streaming. Enviar video_config antes de watching causaría
-                // que el cliente lo descarte porque configReadyRef es false.
                 await SendViewerTextAsync(ws, "{\"status\":\"watching\"}");
 
                 var cachedConfig = connMgr.GetVideoConfig(deviceId);
@@ -498,13 +525,6 @@ static async Task HandleViewerWebSocket(
                 logger.LogInformation(
                     "Viewer {ViewerId} ahora observa dispositivo {DeviceId}", viewerId, deviceId);
             }
-            // ══════════════════════════════════════════════════════════════════
-            // FIX #3 — Handler para request_keyframe
-            // ══════════════════════════════════════════════════════════════════
-            // El cliente envía {type:"request_keyframe"} cuando el watchdog
-            // detecta que no llegan frames. Sin este handler, el mensaje se
-            // descartaba y el keyframe nunca se solicitaba al dispositivo.
-            // ══════════════════════════════════════════════════════════════════
             else if (msg?.Type == "request_keyframe")
             {
                 if (!isAuthenticated || watchingDeviceId == null) continue;
@@ -588,18 +608,11 @@ static async Task HandleViewerWebSocket(
     }
 }
 
-/// <summary>
-/// Helper para enviar texto a viewer sin repetir Encoding.UTF8.GetBytes
-/// </summary>
 static async Task SendViewerTextAsync(WebSocket ws, string text)
 {
     var bytes = Encoding.UTF8.GetBytes(text);
     await ws.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
 }
-
-// ──────────────────────────────────────────────────────────────────────────────
-// PROCESADOR DE MENSAJES DE DISPOSITIVO (gestión, no streaming)
-// ──────────────────────────────────────────────────────────────────────────────
 
 static async Task ProcessWsMessageAsync(
     string json,
@@ -640,7 +653,6 @@ static async Task ProcessWsMessageAsync(
                 break;
 
             case "REQUEST_KEYFRAME":
-                // El dispositivo debe manejar este mensaje en su ScreenStreamHandler
                 Serilog.Log.Information(
                     "Request_keyframe reenviado a dispositivo {DeviceId}", deviceId);
                 break;
@@ -658,14 +670,24 @@ static async Task ProcessWsMessageAsync(
     }
 }
 
-// ── ViewerMessage (modelo del protocolo viewer → servidor) ────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// DECLARACIONES DE TIPOS (DEBEN IR AL FINAL DEL ARCHIVO EN TOP-LEVEL STATEMENTS)
+// ──────────────────────────────────────────────────────────────────────────────
+
+
 public class ViewerMessage
 {
     public string Type { get; set; } = "";
     public string? AdminKey { get; set; }
     public string? DeviceId { get; set; }
     public string? EventType { get; set; }
-    public int? X { get; set; }
-    public int? Y { get; set; }
+    public float? X { get; set; }
+    public float? Y { get; set; }
     public int? KeyCode { get; set; }
+}
+
+internal readonly struct PooledFrame
+{
+    public byte[] Buffer { get; init; }
+    public int Length { get; init; }
 }
