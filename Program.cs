@@ -153,6 +153,8 @@ using (var scope = app.Services.CreateScope())
     }
 }
 
+using var sendCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+
 // ── Endpoint WebSocket para dispositivos ─────────────────────────────────────
 app.MapGet("/ws/device", HandleDeviceWebSocket);
 
@@ -673,7 +675,6 @@ static async Task ProcessWsMessageAsync(
 // ──────────────────────────────────────────────────────────────────────────────
 // DECLARACIONES DE TIPOS (DEBEN IR AL FINAL DEL ARCHIVO EN TOP-LEVEL STATEMENTS)
 // ──────────────────────────────────────────────────────────────────────────────
-
 
 public class ViewerMessage
 {
